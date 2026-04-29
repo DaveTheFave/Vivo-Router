@@ -1,0 +1,23 @@
+[Unit]
+Description=Vivo-Router GUI Dashboard
+Documentation=https://github.com/DaveTheFave/Vivo-Router
+After=network-online.target dnsmasq.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+# NOTE: setup.sh installs the dashboard relative to the cloned repo directory
+# and writes a generated copy of this file with the correct absolute paths.
+# The paths below assume the repo was cloned to /opt/vivo-router.
+# If you cloned elsewhere, update WorkingDirectory and ExecStart accordingly.
+WorkingDirectory=/opt/vivo-router/dashboard
+ExecStart=/opt/vivo-router/dashboard/.venv/bin/python /opt/vivo-router/dashboard/app.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# Expose on all interfaces so LAN clients can also reach the dashboard
+Environment=DASHBOARD_PORT=5000
+
+[Install]
+WantedBy=multi-user.target
