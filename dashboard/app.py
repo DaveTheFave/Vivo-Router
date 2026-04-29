@@ -304,6 +304,95 @@ def get_recent_errors(n: int = 20) -> list:
     return errors[:n]
 
 
+def get_firewall_status() -> dict:
+    """Return nftables service status and a summary of the active ruleset."""
+    status = {
+        "service": "unknown",
+        "active": False,
+        "rules_summary": [],
+    }
+
+    # Service status
+    svc = _run(["systemctl", "is-active", "nftables"])
+    status["service"] = svc if svc else "inactive"
+    status["active"] = svc == "active"
+
+    # Quick rule count per chain via nft list ruleset
+    try:
+        raw = _run(["nft", "list", "ruleset"])
+        chains = re.findall(r"chain\s+(\S+)\s*\{", raw)
+        tables = re.findall(r"table\s+\w+\s+(\S+)\s*\{", raw)
+        rule_lines = [l.strip() for l in raw.splitlines()
+                      if l.strip() and not l.strip().startswith(("#", "table", "chain", "}", "{", "flush"))]
+        status["rules_summary"] = [
+            {"key": "Tables", "value": ", ".join(dict.fromkeys(tables)) or "–"},
+            {"key": "Chains", "value": str(len(chains))},
+            {"key": "Rules",  "value": str(len(rule_lines))},
+        ]
+    except Exception as exc:
+        log.warning("get_firewall_status error: %s", exc)
+
+    return status
+
+
+def get_port_forwards() -> list:
+    """Return static port-forward rules from router.conf."""
+    forwards = []
+    for line in CONF_FILE.read_text().splitlines() if CONF_FILE.exists() else []:
+        line = line.strip()
+        if line.startswith("PORT_FORWARD="):
+            value = line.partition("=")[2].strip()
+            parts = value.split(":")
+            if len(parts) == 4:
+                proto, ext_port, int_ip, int_port = parts
+                forwards.append({
+                    "proto":    proto.upper(),
+                    "ext_port": ext_port,
+                    "int_ip":   int_ip,
+                    "int_port": int_port,
+                })
+    return forwards
+
+
+def get_upnp_leases() -> list:
+    """
+    Parse /var/log/miniupnpd.leases for active UPnP/NAT-PMP mappings.
+    File format: proto|ext_port|int_ip|int_port|description|expiry_ts
+    """
+    leases_file = Path("/var/log/miniupnpd.leases")
+    leases = []
+    if not leases_file.exists():
+        return leases
+    now = int(time.time())
+    try:
+        for line in leases_file.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("|")
+            if len(parts) < 6:
+                continue
+            proto, ext_port, int_ip, int_port, desc, expiry = (
+                parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+            )
+            try:
+                exp_ts = int(expiry)
+                remaining = exp_ts - now if exp_ts > 0 else -1
+            except ValueError:
+                remaining = -1
+            leases.append({
+                "proto":     proto.upper(),
+                "ext_port":  ext_port,
+                "int_ip":    int_ip,
+                "int_port":  int_port,
+                "desc":      desc or "(unknown)",
+                "remaining": remaining,
+            })
+    except Exception as exc:
+        log.warning("get_upnp_leases error: %s", exc)
+    return leases
+
+
 # ── routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -320,6 +409,9 @@ def api_stats():
     system = get_system_stats()
     pihole = get_pihole_stats()
     errors = get_recent_errors()
+    firewall = get_firewall_status()
+    port_forwards = get_port_forwards()
+    upnp = get_upnp_leases()
 
     wan_iface = CONF["WAN_IFACE"]
     lan_iface = CONF["LAN_IFACE"]
@@ -336,6 +428,9 @@ def api_stats():
         "system": system,
         "pihole": pihole,
         "recent_errors": errors,
+        "firewall": firewall,
+        "port_forwards": port_forwards,
+        "upnp_leases": upnp,
     })
 
 
@@ -357,6 +452,24 @@ def api_speeds():
 @app.route("/api/system")
 def api_system():
     return jsonify(get_system_stats())
+
+
+@app.route("/api/firewall")
+def api_firewall():
+    return jsonify(get_firewall_status())
+
+
+@app.route("/api/upnp")
+def api_upnp():
+    return jsonify({
+        "enabled": CONF.get("UPNP_ENABLED", "false").lower() == "true",
+        "leases": get_upnp_leases(),
+    })
+
+
+@app.route("/api/portforwards")
+def api_portforwards():
+    return jsonify(get_port_forwards())
 
 
 if __name__ == "__main__":

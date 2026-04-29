@@ -68,6 +68,9 @@ async function fetchStats() {
   renderSystem(data.system || {});
   renderPihole(data.pihole || {});
   renderErrors(data.recent_errors || []);
+  renderFirewall(data.firewall || {});
+  renderPortForwards(data.port_forwards || []);
+  renderUpnp(data.upnp_leases || [], data.firewall);
   setText("last-updated", "Last updated: " + new Date().toLocaleTimeString());
 }
 
@@ -209,6 +212,78 @@ function escHtml(str) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#x27;");
+}
+
+// ── firewall status ───────────────────────────────────────────────────────────
+function renderFirewall(fw) {
+  const badge = document.getElementById("fw-badge");
+  if (badge) {
+    const state = fw.active ? "active" : (fw.service || "unknown");
+    badge.textContent = fw.service || "unknown";
+    badge.className = "fw-status-badge " + (fw.active ? "active" : (fw.service === "inactive" ? "inactive" : "unknown"));
+  }
+
+  const summary = fw.rules_summary || [];
+  const ids = { "Tables": "fw-tables", "Chains": "fw-chains", "Rules": "fw-rules" };
+  for (const item of summary) {
+    const el = document.getElementById(ids[item.key]);
+    if (el) el.textContent = item.value;
+  }
+}
+
+// ── static port forwards ──────────────────────────────────────────────────────
+function renderPortForwards(forwards) {
+  setText("pf-count", String(forwards.length));
+  const tbody = document.getElementById("pf-tbody");
+  if (!tbody) return;
+
+  if (forwards.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty-row">No static rules configured</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = forwards.map(r => `
+    <tr>
+      <td class="proto ${escHtml(r.proto.toLowerCase())}">${escHtml(r.proto)}</td>
+      <td class="port">${escHtml(r.ext_port)}</td>
+      <td style="color:var(--text-muted)">→</td>
+      <td class="ip">${escHtml(r.int_ip)}</td>
+      <td class="port">${escHtml(r.int_port)}</td>
+    </tr>
+  `).join("");
+}
+
+// ── UPnP leases ───────────────────────────────────────────────────────────────
+function renderUpnp(leases, fw) {
+  // derive enabled state from firewall data (upnp_enabled not in api/stats root yet)
+  const badge = document.getElementById("upnp-badge");
+  if (badge) {
+    // if there are leases, UPnP is clearly active
+    const enabled = leases.length > 0;
+    badge.textContent = enabled ? "active" : "–";
+    badge.className = "upnp-status-badge " + (enabled ? "enabled" : "disabled");
+  }
+
+  setText("upnp-count", String(leases.length));
+  const tbody = document.getElementById("upnp-tbody");
+  if (!tbody) return;
+
+  if (leases.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-row">No active UPnP mappings</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = leases.map(r => `
+    <tr>
+      <td class="proto ${escHtml(r.proto.toLowerCase())}">${escHtml(r.proto)}</td>
+      <td class="port">${escHtml(r.ext_port)}</td>
+      <td style="color:var(--text-muted)">→</td>
+      <td class="ip">${escHtml(r.int_ip)}</td>
+      <td class="port">${escHtml(r.int_port)}</td>
+      <td>${escHtml(r.desc)}</td>
+      <td><span class="lease-pill">${fmtLease(r.remaining)}</span></td>
+    </tr>
+  `).join("");
 }
 
 // ── polling loop ──────────────────────────────────────────────────────────────

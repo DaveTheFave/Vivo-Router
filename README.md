@@ -9,7 +9,10 @@ Turn an Ubuntu server (e.g., a laptop) into a fully-featured router / gateway, c
 | Feature | Details |
 |---|---|
 | **Interactive setup wizard** | `setup.sh` walks you through every configuration step |
-| **NAT / IP Forwarding** | iptables masquerade rules with persistence across reboots |
+| **nftables firewall** | Deny-by-default stateful firewall; replaces legacy iptables |
+| **NAT / IP Forwarding** | nftables masquerade rules with persistence across reboots |
+| **Static port forwarding** | DNAT rules to an internal server; DHCP reservation by MAC |
+| **UPnP / IGD** | miniupnpd lets LAN devices open ports automatically |
 | **DHCP + DNS** | dnsmasq configured for your LAN subnet |
 | **Pi-hole integration** | Optional DNS-level ad blocking, wired automatically to dnsmasq |
 | **GUI Dashboard** | Dark-themed web dashboard served by Flask on port 5000 |
@@ -17,6 +20,9 @@ Turn an Ubuntu server (e.g., a laptop) into a fully-featured router / gateway, c
 | **WAN IP** | Real-time WAN IP address display |
 | **Link speeds** | Per-interface upload / download in B/s → MB/s |
 | **Pi-hole stats** | Domains blocked, queries today, block %, unique clients |
+| **Firewall panel** | nftables service status, table/chain/rule counts |
+| **Port Forwarding panel** | Static DNAT rules shown in the dashboard |
+| **UPnP Leases panel** | Live miniupnpd dynamic mappings in the dashboard |
 | **System health** | CPU %, RAM %, Disk %, CPU temp, uptime |
 | **Error log** | Recent dnsmasq and syslog errors shown in the dashboard |
 | **Kiosk mode** | Chromium opens the dashboard fullscreen on boot |
@@ -72,6 +78,8 @@ The wizard will ask you for:
 | DHCP lease time | `24h` |
 | Upstream DNS servers | `1.1.1.1`, `8.8.8.8` |
 | Install Pi-hole? | `y` / `n` |
+| Port forwarding? | `y` / `n` — if yes: server IP, MAC, rules |
+| Enable UPnP/IGD? | `y` / `n` |
 | Kiosk mode on this screen? | `y` / `n` |
 
 ### 3. Reboot
@@ -95,6 +103,9 @@ The dashboard auto-refreshes every **5 seconds** and shows:
 - ⚙ **System resources** — CPU, RAM, Disk progress bars + CPU temperature
 - ⏱ **Uptime** — server uptime
 - ⚠ **Error log** — last 20 lines from dnsmasq/syslog matching error patterns
+- 🛡 **Firewall** — nftables service status, table/chain/rule counts
+- 🔀 **Port Forwarding** — static DNAT rules configured during setup
+- 🔌 **UPnP Leases** — live dynamic port mappings created by miniupnpd
 
 ### Running manually (development)
 
@@ -160,6 +171,9 @@ Vivo-Router/
 | `GET /api/speeds` | Per-interface TX/RX rates |
 | `GET /api/system` | CPU, RAM, Disk, Temp, Uptime |
 | `GET /api/pihole` | Pi-hole summary stats |
+| `GET /api/firewall` | nftables service status and rule summary |
+| `GET /api/portforwards` | Static port-forward rules |
+| `GET /api/upnp` | miniupnpd status and active lease list |
 
 ---
 

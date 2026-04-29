@@ -485,3 +485,101 @@ footer.statusbar {
   }
   .cards-row { grid-column: 1; }
 }
+
+/* ── bottom row (firewall · port-forward · UPnP) ─────────────────────────── */
+.bottom-row {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 220px 1fr 1fr;
+  gap: 14px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .bottom-row { grid-template-columns: 1fr; }
+}
+
+/* Firewall status */
+.fw-status-badge {
+  font-size: .75rem;
+  font-weight: 700;
+  padding: 2px 10px;
+  border-radius: 20px;
+  text-transform: uppercase;
+}
+
+.fw-status-badge.active   { background: var(--green); color: #000; }
+.fw-status-badge.inactive { background: var(--red);   color: #fff; }
+.fw-status-badge.unknown  { background: var(--surface2); color: var(--text-muted); border: 1px solid var(--border); }
+
+.fw-summary { display: flex; flex-direction: column; gap: 6px; }
+
+.fw-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: .84rem;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--surface2);
+}
+.fw-row:last-child { border-bottom: none; }
+
+.fw-key { color: var(--text-muted); }
+.fw-val { font-weight: 600; color: var(--cyan); font-variant-numeric: tabular-nums; }
+
+/* Port-forward / UPnP tables (shared with .pf-table) */
+.pf-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .84rem;
+}
+
+.pf-table th {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-weight: 500;
+  text-transform: uppercase;
+  font-size: .72rem;
+  letter-spacing: .5px;
+}
+
+.pf-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--surface2);
+  font-variant-numeric: tabular-nums;
+}
+
+.pf-table tr:last-child td { border-bottom: none; }
+.pf-table tr:hover td     { background: var(--surface2); }
+
+.pf-table td.proto {
+  font-family: var(--font-mono);
+  font-size: .78rem;
+  font-weight: 700;
+}
+.pf-table td.proto.tcp { color: var(--blue);   }
+.pf-table td.proto.udp { color: var(--purple); }
+
+.pf-table td.port {
+  font-family: var(--font-mono);
+  color: var(--green);
+}
+
+.pf-table td.ip {
+  font-family: var(--font-mono);
+  color: var(--blue);
+}
+
+/* UPnP status badge */
+.upnp-status-badge {
+  font-size: .75rem;
+  font-weight: 700;
+  padding: 2px 10px;
+  border-radius: 20px;
+  text-transform: uppercase;
+}
+
+.upnp-status-badge.enabled  { background: var(--green); color: #000; }
+.upnp-status-badge.disabled { background: var(--surface2); color: var(--text-muted); border: 1px solid var(--border); }

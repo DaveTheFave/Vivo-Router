@@ -205,6 +205,61 @@
 
   </div><!-- /.col-right -->
 
+  <!-- ── Row 3: Firewall · Port Forwarding · UPnP ─────────────────────────── -->
+  <div class="bottom-row">
+
+    <!-- Firewall status panel -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">🛡 Firewall</span>
+        <span class="fw-status-badge" id="fw-badge">–</span>
+      </div>
+      <div class="fw-summary" id="fw-summary">
+        <div class="fw-row"><span class="fw-key">Tables</span><span class="fw-val" id="fw-tables">–</span></div>
+        <div class="fw-row"><span class="fw-key">Chains</span><span class="fw-val" id="fw-chains">–</span></div>
+        <div class="fw-row"><span class="fw-key">Rules</span><span class="fw-val" id="fw-rules">–</span></div>
+      </div>
+    </div>
+
+    <!-- Static port forwarding panel -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">🔀 Port Forwarding</span>
+        <span class="count-badge" id="pf-count">0</span>
+      </div>
+      <div class="table-scroll">
+        <table class="pf-table">
+          <thead>
+            <tr><th>Proto</th><th>WAN Port</th><th>→</th><th>Internal Host</th><th>Int. Port</th></tr>
+          </thead>
+          <tbody id="pf-tbody">
+            <tr><td colspan="5" class="empty-row">No static rules configured</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- UPnP leases panel -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">🔌 UPnP Leases</span>
+        <span class="upnp-status-badge" id="upnp-badge">–</span>
+        <span class="count-badge" id="upnp-count">0</span>
+      </div>
+      <div class="table-scroll">
+        <table class="pf-table">
+          <thead>
+            <tr><th>Proto</th><th>WAN Port</th><th>→</th><th>Internal Host</th><th>Int. Port</th><th>Desc</th><th>Lease</th></tr>
+          </thead>
+          <tbody id="upnp-tbody">
+            <tr><td colspan="7" class="empty-row">No active UPnP mappings</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div><!-- /.bottom-row -->
+
 </main>
 
 <!-- ═══════════════════════════ STATUS BAR ══════════════════════════════════ -->
