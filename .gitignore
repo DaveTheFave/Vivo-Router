@@ -1,0 +1,14 @@
+# Python
+dashboard/.venv/
+dashboard/__pycache__/
+dashboard/*.pyc
+dashboard/router.conf
+
+# Editor
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

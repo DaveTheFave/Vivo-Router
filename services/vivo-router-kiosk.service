@@ -1,0 +1,29 @@
+[Unit]
+Description=Vivo-Router Dashboard Kiosk (Chromium fullscreen)
+Documentation=https://github.com/DaveTheFave/Vivo-Router
+After=graphical.target vivo-router-dashboard.service
+Requires=vivo-router-dashboard.service
+
+[Service]
+Type=simple
+User=root
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/root/.Xauthority
+# Give the dashboard a moment to fully start before opening the browser
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/chromium-browser \
+    --noerrdialogs \
+    --disable-infobars \
+    --disable-session-crashed-bubble \
+    --disable-component-update \
+    --check-for-update-interval=31536000 \
+    --kiosk \
+    --no-first-run \
+    --disable-extensions \
+    --start-fullscreen \
+    http://localhost:5000
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=graphical.target
