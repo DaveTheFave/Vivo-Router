@@ -148,7 +148,7 @@ info "Updating package lists…"
 apt-get update -qq
 
 PKGS=(
-    iptables iptables-persistent netfilter-persistent
+    iptables
     dnsmasq curl wget git
     net-tools iproute2 nftables
     python3 python3-pip python3-venv
@@ -171,6 +171,101 @@ if $KIOSK_MODE; then
 fi
 
 success "Packages installed."
+
+# -- Step X - 6to4 IPv6 tunneling (optional) ───────────────────────────────────────────────
+
+echo ""
+hr
+echo -e "${BOLD}STEP X — IPv6 (6to4) Auto‑Configuration${NC}"
+hr
+echo ""
+
+info "Setting up dynamic 6to4 IPv6…"
+
+# 6to4 prefix is 2002:W.X.Y.Z::/48 where W.X.Y.Z is WAN IPv4
+WAN_IPV4=$(curl -4 -s https://ifconfig.me || true)
+
+if [[ -z "$WAN_IPV4" ]]; then
+    warn "Could not detect WAN IPv4; skipping 6to4 setup."
+else
+    info "Detected WAN IPv4: ${WAN_IPV4}"
+
+    # Convert IPv4 to hex for 6to4 prefix
+    IFS=. read -r o1 o2 o3 o4 <<< "$WAN_IPV4"
+    HEX_PREFIX=$(printf "%02x%02x:%02x%02x" "$o1" "$o2" "$o3" "$o4")
+    SIXTO4_PREFIX="2002:${HEX_PREFIX}::/48"
+
+    info "Computed 6to4 prefix: ${SIXTO4_PREFIX}"
+
+    # Assign LAN IPv6 (2002:xxxx:xxxx:1::1/64)
+    info "Priming 6to4 state via updater…"
+    /usr/local/bin/vivo-6to4-update || warn "Initial 6to4 update failed; timer will retry."
+
+
+    # Persist via systemd service
+    SIXTO4_SERVICE="/etc/systemd/system/vivo-6to4.service"
+    SIXTO4_TIMER="/etc/systemd/system/vivo-6to4.timer"
+
+    cat > "$SIXTO4_SERVICE" <<EOF
+[Unit]
+Description=Dynamic 6to4 IPv6 updater
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vivo-6to4-update
+
+EOF
+
+    cat > "$SIXTO4_TIMER" <<EOF
+[Unit]
+Description=Run 6to4 updater every 5 minutes
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    # Write updater script
+    cat > /usr/local/bin/vivo-6to4-update <<EOF
+#!/usr/bin/env bash
+set -e
+
+WAN_IFACE="${WAN_IFACE}"
+LAN_IFACE="${LAN_IFACE}"
+
+WAN_IPV4=\$(ip -4 addr show \$WAN_IFACE | awk '/inet /{print \$2}' | cut -d/ -f1)
+[[ -z "\$WAN_IPV4" ]] && exit 0
+
+IFS=. read -r o1 o2 o3 o4 <<< "\$WAN_IPV4"
+HEX_PREFIX=\$(printf "%02x%02x:%02x%02x" "\$o1" "\$o2" "\$o3" "\$o4")
+PREFIX="2002:\${HEX_PREFIX}"
+
+LAN_IPV6="\${PREFIX}:1::1/64"
+
+ip -6 addr flush dev "\$LAN_IFACE" scope global || true
+ip -6 addr add "\$LAN_IPV6" dev "\$LAN_IFACE" || true
+
+# Update dnsmasq RA prefix
+sed -i "s|^#*dhcp-range=.*ra-only|dhcp-range=\${PREFIX}:1::100,\${PREFIX}:1::1ff,64,ra-only|" /etc/dnsmasq.d/vivo-router.conf
+sed -i "s|^#*enable-ra|enable-ra|" /etc/dnsmasq.d/vivo-router.conf
+
+systemctl restart dnsmasq || true
+EOF
+
+    chmod +x /usr/local/bin/vivo-6to4-update
+
+    /usr/local/bin/vivo-6to4-update || true
+
+    systemctl daemon-reload
+    systemctl enable vivo-6to4.timer >/dev/null 2>&1
+    systemctl start vivo-6to4.timer
+
+    success "6to4 IPv6 automation installed."
+fi
 
 # ── step 4 – configure static IP on LAN interface ────────────────────────────
 echo ""
@@ -207,28 +302,91 @@ echo -e "${BOLD}STEP 5 — IP Forwarding & NAT${NC}"
 hr
 echo ""
 
-info "Enabling IP forwarding…"
-if ! grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf; then
-    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-fi
+info "Enabling IP forwarding and ipv6 forwarding…"
+grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+grep -q '^net.ipv6.conf.all.forwarding=1' /etc/sysctl.conf || echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
+
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
 
-info "Configuring iptables NAT rules…"
-# Flush existing rules only in NAT/FORWARD to be non-destructive
-iptables -t nat -F POSTROUTING 2>/dev/null || true
-iptables -F FORWARD 2>/dev/null || true
+info "Configuring nftables firewall and NAT…"
 
-iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE
-iptables -A FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT
-iptables -A FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+NFT_CONF="/etc/nftables.conf"
 
-info "Saving iptables rules for persistence…"
-mkdir -p /etc/iptables
-iptables-save > /etc/iptables/rules.v4
-ip6tables-save > /etc/iptables/rules.v6
+cat > "$NFT_CONF" <<EOF
+#!/usr/sbin/nft -f
 
-systemctl enable netfilter-persistent >/dev/null 2>&1 || true
-success "IP forwarding and NAT configured."
+flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority 0;
+        policy drop;
+
+        # Allow loopback
+        iif lo accept
+
+        # Allow established/related
+        ct state established,related accept
+
+        # Allow LAN to router
+        iifname "${LAN_IFACE}" accept
+
+        # Allow essential ICMP/ICMPv6
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+
+        # Allow SSH from LAN only (optional)
+        tcp dport 22 iifname "${LAN_IFACE}" accept
+    }
+
+    chain forward {
+        type filter hook forward priority 0;
+        policy drop;
+
+        # Allow established/related
+        ct state established,related accept
+
+        # Allow LAN -> WAN (IPv4 + IPv6)
+        iifname "${LAN_IFACE}" oifname "${WAN_IFACE}" accept
+
+        # (Optional) allow LAN -> LAN (if multiple LAN segments later)
+        iifname "${LAN_IFACE}" oifname "${LAN_IFACE}" accept
+    }
+
+    chain output {
+        type filter hook output priority 0;
+        policy accept;
+    }
+}
+
+table ip nat {
+    chain postrouting {
+        type nat hook postrouting priority 100;
+        policy accept;
+
+        # IPv4 masquerade LAN -> WAN
+        oifname "${WAN_IFACE}" ip saddr ${LAN_SUBNET} masquerade
+    }
+}
+
+table ip6 nat {
+    chain postrouting {
+        type nat hook postrouting priority 100;
+        policy accept;
+
+        # IPv6 masquerade LAN -> WAN (6to4 and any other global IPv6)
+        oifname "${WAN_IFACE}" masquerade
+    }
+}
+EOF
+
+systemctl enable nftables >/dev/null 2>&1 || true
+systemctl restart nftables || warn "nftables failed to start; check 'journalctl -u nftables'."
+
+success "nftables firewall and NAT configured."
+
+
 
 # ── step 6 – dnsmasq ──────────────────────────────────────────────────────────
 echo ""
@@ -259,6 +417,10 @@ dhcp-option=option:dns-server,${LAN_IP}
 # Upstream DNS (used when Pi-hole is not installed)
 server=${DNS1}
 server=${DNS2}
+
+# IPv6 RA (router advertisements) - template for 6to4 updater
+# enable-ra
+# dhcp-range=2002:XXXX:XXXX:1::100,2002:XXXX:XXXX:1::1ff,64,ra-only
 
 # Logging (used by the dashboard to show errors)
 log-dhcp
@@ -422,6 +584,8 @@ EOF
     systemctl enable vivo-router-kiosk >/dev/null 2>&1
     success "Kiosk service installed (starts on next graphical boot)."
 fi
+
+
 
 # ── done ──────────────────────────────────────────────────────────────────────
 echo ""
