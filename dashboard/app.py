@@ -283,41 +283,183 @@ def get_health_checks() -> dict:
     }
 
 
-def get_active_clients() -> list:
-    """Return active DHCP clients.
+def get_arp_clients() -> dict:
+    """Scan ARP table to discover connected clients.
 
-    If the AP is configured to handle DHCP (AP_DHCP_ENABLED=true), attempt
-    to query the AP for its active stations and per-client usage. Otherwise
-    fall back to parsing the local dnsmasq leases file (/var/lib/misc/dnsmasq.leases).
+    Returns dict mapping MAC -> {mac, ip, hostname}.
+    Filters to LAN interface to avoid router management traffic.
     """
-    if str(CONF.get("AP_DHCP_ENABLED", "false")).lower() == "true":
-        ap_clients = get_ap_clients()
-        if ap_clients:
-            return ap_clients
+    import socket
+    clients = {}
+    lan_iface = CONF.get("LAN_IFACE", "eth1")
 
-    # Default: local dnsmasq leases
-    leases_file = Path("/var/lib/misc/dnsmasq.leases")
-    clients = []
-    if not leases_file.exists():
-        return clients
-    now = int(time.time())
     try:
-        for line in leases_file.read_text().splitlines():
-            parts = line.split()
-            if len(parts) < 4:
-                continue
-            expiry, mac, ip, hostname = parts[0], parts[1], parts[2], parts[3]
-            hostname = hostname if hostname != "*" else "(unknown)"
-            remaining = int(expiry) - now if expiry.isdigit() else -1
-            if remaining > 0 or int(expiry) == 0:  # 0 = static lease
-                clients.append({
-                    "ip": ip,
+        with open("/proc/net/arp") as f:
+            for line in f.readlines()[1:]:  # Skip header
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+
+                ip = parts[0]
+                hw_type = parts[1]
+                mac = parts[3].lower()
+                device = parts[5] if len(parts) > 5 else ""
+
+                # Skip invalid MACs and filter to LAN interface
+                if mac == "00:00:00:00:00:00" or device != lan_iface:
+                    continue
+
+                # Validate MAC format
+                if not re.match(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", mac, re.I):
+                    continue
+
+                clients[mac] = {
                     "mac": mac,
-                    "hostname": hostname,
-                    "lease_remaining": remaining,
-                })
+                    "ip": ip,
+                    "hostname": "(unknown)",
+                }
     except Exception as exc:
-        log.warning("get_active_clients error: %s", exc)
+        log.warning("get_arp_clients error: %s", exc)
+
+    return clients
+
+
+def get_hostname(ip: str) -> str | None:
+    """Attempt reverse DNS lookup with timeout.
+
+    Returns hostname string or None if lookup fails/times out.
+    Uses a 2-second timeout to prevent blocking the dashboard.
+    """
+    import socket
+    try:
+        # Set socket timeout to 2 seconds
+        socket.setdefaulttimeout(2.0)
+        hostname = socket.gethostbyaddr(ip)[0]
+        socket.setdefaulttimeout(None)  # Reset to default
+        return hostname
+    except (socket.herror, socket.gaierror, socket.timeout):
+        return None
+    except Exception as exc:
+        log.debug("get_hostname(%s) error: %s", ip, exc)
+        return None
+
+
+def get_tplink_ap_clients() -> dict:
+    """Get connected clients from TP-Link Archer BE11000 AP via tplinkrouterc6u.
+
+    Returns dict mapping MAC -> {ip, hostname}.
+    Returns empty dict if AP not configured or connection fails.
+    """
+    if not CONF.get("AP_ENABLED", "false").lower() == "true":
+        return {}
+
+    try:
+        from tplinkrouterc6u import TplinkRouter
+
+        ap_ip = CONF.get("AP_IP")
+        ap_user = CONF.get("AP_USERNAME", "admin")
+        # Support both AP_PASSWORD and AP_PSW environment variable names
+        ap_pass = CONF.get("AP_PASSWORD") or CONF.get("AP_PSW") or ""
+        ap_timeout = int(CONF.get("AP_TIMEOUT", "5"))
+
+        if not (ap_ip and ap_pass):
+            log.debug("AP configured but missing AP_IP or AP_PASSWORD/AP_PSW")
+            return {}
+
+        router = TplinkRouter(
+            host=ap_ip,
+            username=ap_user,
+            password=ap_pass,
+            timeout=ap_timeout
+        )
+
+        # Authorize and get DHCP leases
+        router.authorize()
+        leases_data = router.get_ipv4_dhcp_leases()
+        router.logout()
+
+        # Parse DHCP leases into client dict
+        result = {}
+        if leases_data and isinstance(leases_data, dict):
+            lease_list = leases_data.get("lease_list", []) or leases_data.get("result", {}).get("lease_list", [])
+            for lease in lease_list:
+                mac = (lease.get("mac") or "").lower()
+                if not mac:
+                    continue
+                result[mac] = {
+                    "ip": lease.get("ipaddr"),
+                    "hostname": lease.get("hostname", "(unknown)"),
+                    "rx_bytes": 0,  # Not available from DHCP leases
+                    "tx_bytes": 0,
+                }
+
+        log.info("get_tplink_ap_clients: found %d clients on AP", len(result))
+        return result
+
+    except ImportError:
+        log.debug("tplinkrouterc6u not installed; AP client data unavailable")
+        return {}
+    except Exception as exc:
+        log.debug("get_tplink_ap_clients error: %s", exc)
+        return {}
+
+
+def get_active_clients() -> list:
+    """Discover active clients using ARP table scanning + TP-Link AP data.
+
+    1. Scans /proc/net/arp to find connected clients on LAN interface
+    2. Attempts reverse DNS lookup for hostnames (2-second timeout)
+    3. Merges with AP client data from tplinkrouterc6u (IP, hostname, usage)
+    4. Returns combined client list with priority: AP data > ARP data
+    """
+    # Get clients from ARP table
+    arp_clients = get_arp_clients()
+    if not arp_clients:
+        return []
+
+    # Get AP client data (includes hostname, IP, usage from AP)
+    ap_clients = get_tplink_ap_clients()
+
+    # Resolve hostnames via reverse DNS (only if not from AP)
+    for mac, client in arp_clients.items():
+        if mac not in ap_clients:
+            hostname = get_hostname(client["ip"])
+            if hostname:
+                client["hostname"] = hostname
+
+    # Build final client list, prioritizing AP data over ARP
+    clients = []
+    for mac, arp_data in arp_clients.items():
+        if mac in ap_clients:
+            # Use AP data (has hostname, IP, and usage)
+            ap_data = ap_clients[mac]
+            rx = ap_data.get("rx_bytes", 0) or 0
+            tx = ap_data.get("tx_bytes", 0) or 0
+            clients.append({
+                "mac": mac,
+                "ip": ap_data.get("ip") or arp_data["ip"],
+                "hostname": ap_data.get("hostname", "(unknown)"),
+                "lease_remaining": -1,
+                "rx_bytes": rx,
+                "tx_bytes": tx,
+                "rx_human": _human_bytes(rx),
+                "tx_human": _human_bytes(tx),
+                "total_human": _human_bytes(rx + tx),
+            })
+        else:
+            # Use ARP data only
+            clients.append({
+                "mac": mac,
+                "ip": arp_data["ip"],
+                "hostname": arp_data["hostname"],
+                "lease_remaining": -1,
+                "rx_bytes": 0,
+                "tx_bytes": 0,
+                "rx_human": _human_bytes(0),
+                "tx_human": _human_bytes(0),
+                "total_human": _human_bytes(0),
+            })
+
     return clients
 
 
