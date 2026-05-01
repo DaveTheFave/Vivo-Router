@@ -324,24 +324,97 @@ def get_arp_clients() -> dict:
     return clients
 
 
-def get_hostname(ip: str) -> str | None:
-    """Attempt reverse DNS lookup with timeout.
+def resolve_hostname_avahi(ip: str, timeout: float = 1.5) -> str | None:
+    """Resolve IP to hostname using avahi-resolve (mDNS).
 
-    Returns hostname string or None if lookup fails/times out.
-    Uses a 2-second timeout to prevent blocking the dashboard.
+    Returns hostname (e.g., "device.local") or None if resolution fails.
     """
+    try:
+        result = subprocess.run(
+            ["avahi-resolve", "-a", ip],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False
+        )
+        if result.returncode == 0 and result.stdout:
+            # Parse: "192.168.1.100<TAB>device.local"
+            parts = result.stdout.strip().split()
+            if len(parts) >= 2:
+                hostname = parts[1].rstrip('.')
+                return hostname
+        return None
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return None
+    except Exception:
+        return None
+
+
+def resolve_hostname_reverse_dns(ip: str, timeout: float = 1.5) -> str | None:
+    """Fallback: Resolve IP to hostname using reverse DNS."""
     import socket
     try:
-        # Set socket timeout to 2 seconds
-        socket.setdefaulttimeout(2.0)
+        socket.setdefaulttimeout(timeout)
         hostname = socket.gethostbyaddr(ip)[0]
-        socket.setdefaulttimeout(None)  # Reset to default
         return hostname
     except (socket.herror, socket.gaierror, socket.timeout):
         return None
-    except Exception as exc:
-        log.debug("get_hostname(%s) error: %s", ip, exc)
-        return None
+    finally:
+        socket.setdefaulttimeout(None)
+
+
+def get_hostname(ip: str, timeout: float = 2.0) -> str | None:
+    """Resolve hostname with fallback chain.
+
+    1. Try avahi-resolve (mDNS) — primary for local network
+    2. Try reverse DNS — fallback
+    3. Return None if all fail
+    """
+    # Try mDNS first (fast on LANs)
+    hostname = resolve_hostname_avahi(ip, timeout * 0.7)
+    if hostname:
+        return hostname
+
+    # Fallback to reverse DNS
+    hostname = resolve_hostname_reverse_dns(ip, timeout * 0.3)
+    return hostname
+
+
+def get_hostnames_batch(ips: list, timeout: float = 1.5, max_workers: int = 5) -> dict:
+    """Resolve multiple IPs in parallel.
+
+    Returns dict mapping IP -> hostname (or IP if resolution fails).
+    """
+    import concurrent.futures
+    results = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(get_hostname, ip, timeout): ip
+            for ip in ips
+        }
+
+        # Use a longer timeout for as_completed to allow all workers to finish
+        # timeout + (max_workers * overhead) to account for thread scheduling
+        total_timeout = timeout + max_workers
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=total_timeout):
+                ip = futures[future]
+                try:
+                    hostname = future.result()
+                    results[ip] = hostname or ip
+                except Exception:
+                    results[ip] = ip
+        except concurrent.futures.TimeoutError:
+            # Some futures didn't complete in time, add them with IP as fallback
+            for future in futures:
+                if not future.done():
+                    ip = futures[future]
+                    results[ip] = ip
+
+    return results
 
 
 def get_tplink_ap_clients() -> dict:
@@ -405,29 +478,33 @@ def get_tplink_ap_clients() -> dict:
 
 
 def get_active_clients() -> list:
-    """Discover active clients using ARP table scanning + TP-Link AP data.
+    """Discover active clients using ARP + parallel hostname resolution.
 
-    1. Scans /proc/net/arp to find connected clients on LAN interface
-    2. Attempts reverse DNS lookup for hostnames (2-second timeout)
-    3. Merges with AP client data from tplinkrouterc6u (IP, hostname, usage)
-    4. Returns combined client list with priority: AP data > ARP data
+    1. Scans /proc/net/arp for connected clients
+    2. Resolves hostnames in parallel (5 threads) using Avahi + reverse DNS
+    3. Merges with AP data from tplinkrouterc6u
+
+    Returns list of client dicts with: mac, ip, hostname, rx_bytes, tx_bytes,
+    rx_human, tx_human, total_human, lease_remaining.
     """
     # Get clients from ARP table
     arp_clients = get_arp_clients()
     if not arp_clients:
         return []
 
-    # Get AP client data (includes hostname, IP, usage from AP)
+    # Get AP client data
     ap_clients = get_tplink_ap_clients()
 
-    # Resolve hostnames via reverse DNS (only if not from AP)
+    # Resolve all hostnames in parallel (Avahi mDNS + reverse DNS fallback)
+    ips = [client["ip"] for client in arp_clients.values()]
+    hostnames = get_hostnames_batch(ips, timeout=1.5, max_workers=5)
+
+    # Update clients with resolved hostnames (only if not from AP)
     for mac, client in arp_clients.items():
         if mac not in ap_clients:
-            hostname = get_hostname(client["ip"])
-            if hostname:
-                client["hostname"] = hostname
+            client["hostname"] = hostnames.get(client["ip"], "(unknown)")
 
-    # Build final client list, prioritizing AP data over ARP
+    # Build final client list
     clients = []
     for mac, arp_data in arp_clients.items():
         if mac in ap_clients:
