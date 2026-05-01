@@ -3,6 +3,7 @@ dashboard/.venv/
 dashboard/__pycache__/
 dashboard/*.pyc
 dashboard/router.conf
+dashboard/.env
 
 # Editor
 .vscode/

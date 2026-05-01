@@ -10,23 +10,54 @@ import json
 import time
 import subprocess
 import logging
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from datetime import datetime, timezone
+from collections import deque
 
 from flask import Flask, jsonify, render_template, send_from_directory
 
 # ── configuration ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 CONF_FILE = BASE_DIR / "router.conf"
+ENV_FILE = BASE_DIR / ".env"
+
+
+def _load_dotenv(path: Path) -> dict:
+    """Load KEY=VALUE pairs from a .env file."""
+    env = {}
+    if not path.exists():
+        return env
+
+    for raw_line in path.read_text(errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+
+        # Support common .env quoting style.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+
+        if key:
+            env[key] = value
+
+    return env
 
 def load_conf() -> dict:
-    """Load key=value pairs from router.conf written by setup.sh."""
+    """Load runtime config from router.conf, then override with .env and process env."""
     conf = {
         "WAN_IFACE": "eth0",
         "LAN_IFACE": "eth1",
         "LAN_IP": "192.168.1.1",
         "PIHOLE_ENABLED": "false",
-        "PIHOLE_API": "http://localhost/admin/api.php",
+        "PIHOLE_API": "http://localhost/api",
+        "PIHOLE_PASSWORD": "",
     }
     if CONF_FILE.exists():
         for line in CONF_FILE.read_text().splitlines():
@@ -34,6 +65,16 @@ def load_conf() -> dict:
             if line and "=" in line and not line.startswith("#"):
                 k, _, v = line.partition("=")
                 conf[k.strip()] = v.strip()
+
+    # Allow secrets such as PIHOLE_PASSWORD to live outside router.conf.
+    conf.update(_load_dotenv(ENV_FILE))
+
+    # Environment variables have final precedence.
+    for key in conf:
+        env_val = os.environ.get(key)
+        if env_val is not None:
+            conf[key] = env_val
+
     return conf
 
 CONF = load_conf()
@@ -41,6 +82,43 @@ CONF = load_conf()
 app = Flask(__name__, template_folder="templates", static_folder="static")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vivo-router")
+
+# ── bandwidth history (rolling 1-hour buffer) ─────────────────────────────────
+
+class BandwidthHistory:
+    """Maintain rolling 1-hour history of WAN/LAN bandwidth samples."""
+    def __init__(self, max_samples=60):
+        self.wan_history = deque(maxlen=max_samples)
+        self.lan_history = deque(maxlen=max_samples)
+        self.last_sample_time = 0
+        self.sample_interval = 60  # sample every 60 seconds
+
+    def update(self, wan_speed: dict, lan_speed: dict):
+        """Add a sample to the history if enough time has passed."""
+        now = time.time()
+        if now - self.last_sample_time < self.sample_interval:
+            return
+        self.last_sample_time = now
+        
+        self.wan_history.append({
+            "ts": now,
+            "rx_mbps": (wan_speed.get("rx_bytes_sec", 0) * 8) / 1_000_000,
+            "tx_mbps": (wan_speed.get("tx_bytes_sec", 0) * 8) / 1_000_000,
+        })
+        self.lan_history.append({
+            "ts": now,
+            "rx_mbps": (lan_speed.get("rx_bytes_sec", 0) * 8) / 1_000_000,
+            "tx_mbps": (lan_speed.get("tx_bytes_sec", 0) * 8) / 1_000_000,
+        })
+
+    def get_history(self) -> dict:
+        """Return current history as dict of lists."""
+        return {
+            "wan": list(self.wan_history),
+            "lan": list(self.lan_history),
+        }
+
+bandwidth_history = BandwidthHistory()
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -135,8 +213,89 @@ def _human_bytes(bps: float) -> str:
     return f"{bps:.1f} TB/s"
 
 
+def get_gateway_health() -> dict:
+    """Check if the default gateway is reachable (ping test)."""
+    try:
+        # Get default gateway from routing table
+        route_out = _run(["ip", "route", "show", "default"])
+        if not route_out:
+            return {"status": "unknown", "response_time_ms": None, "error": "No default route"}
+        
+        match = re.search(r"via (\d+\.\d+\.\d+\.\d+)", route_out)
+        if not match:
+            return {"status": "unknown", "response_time_ms": None, "error": "Could not parse gateway"}
+        
+        gateway = match.group(1)
+        
+        # Ping the gateway (1 ping, 2 second timeout)
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", "2", gateway],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode == 0:
+            # Extract response time from output (e.g., "time=45.2 ms")
+            match = re.search(r"time=([0-9.]+)\s*ms", result.stdout)
+            response_time = float(match.group(1)) if match else None
+            return {
+                "status": "up",
+                "gateway": gateway,
+                "response_time_ms": round(response_time, 1) if response_time else None,
+            }
+        else:
+            return {"status": "down", "gateway": gateway, "response_time_ms": None}
+    except Exception as exc:
+        log.warning("get_gateway_health error: %s", exc)
+        return {"status": "error", "response_time_ms": None, "error": str(exc)}
+
+
+def get_dns_health() -> dict:
+    """Check if DNS is resolving (test domain resolution)."""
+    try:
+        import socket
+        
+        # Try to resolve a test domain (example.com)
+        start = time.time()
+        try:
+            # Use socket.getaddrinfo which is the standard Python DNS resolution
+            socket.getaddrinfo("example.com", 80, socket.AF_INET, socket.SOCK_STREAM)
+            elapsed_ms = round((time.time() - start) * 1000, 1)
+            return {
+                "status": "ok",
+                "response_time_ms": elapsed_ms,
+                "test_domain": "example.com",
+            }
+        except socket.gaierror:
+            return {"status": "failed", "response_time_ms": None, "error": "Name resolution failed"}
+    except Exception as exc:
+        log.warning("get_dns_health error: %s", exc)
+        return {"status": "error", "response_time_ms": None, "error": str(exc)}
+
+
+def get_health_checks() -> dict:
+    """Return combined health status for gateway and DNS."""
+    return {
+        "gateway": get_gateway_health(),
+        "dns": get_dns_health(),
+        "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    }
+
+
 def get_active_clients() -> list:
-    """Parse /var/lib/misc/dnsmasq.leases for active DHCP leases."""
+    """Return active DHCP clients.
+
+    If the AP is configured to handle DHCP (AP_DHCP_ENABLED=true), attempt
+    to query the AP for its active stations and per-client usage. Otherwise
+    fall back to parsing the local dnsmasq leases file (/var/lib/misc/dnsmasq.leases).
+    """
+    if str(CONF.get("AP_DHCP_ENABLED", "false")).lower() == "true":
+        ap_clients = get_ap_clients()
+        if ap_clients:
+            return ap_clients
+
+    # Default: local dnsmasq leases
     leases_file = Path("/var/lib/misc/dnsmasq.leases")
     clients = []
     if not leases_file.exists():
@@ -160,6 +319,147 @@ def get_active_clients() -> list:
     except Exception as exc:
         log.warning("get_active_clients error: %s", exc)
     return clients
+
+
+def _parse_dnsmasq_leases(text: str) -> dict:
+    """Parse dnsmasq.leases text and return mapping mac -> client dict."""
+    res = {}
+    now = int(time.time())
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        expiry, mac, ip, hostname = parts[0], parts[1], parts[2], parts[3]
+        hostname = hostname if hostname != "*" else "(unknown)"
+        remaining = int(expiry) - now if expiry.isdigit() else -1
+        if remaining > 0 or int(expiry) == 0:
+            res[mac.lower()] = {
+                "ip": ip,
+                "mac": mac.lower(),
+                "hostname": hostname,
+                "lease_remaining": remaining,
+            }
+    return res
+
+
+def get_ap_clients() -> list:
+    """Attempt to query the Access Point for active stations and usage.
+
+    Supports two configurable methods via `router.conf` / env:
+      - AP_SSH_HOST / AP_SSH_USER [: AP_SSH_KEY, AP_SSH_PORT]
+        Runs: `iw dev <radio> station dump` on the AP via SSH and parses
+        rx/tx bytes per station. Also tries to read dnsmasq leases on the AP
+        to map MAC -> IP/hostname.
+      - AP_API_LEASES_URL
+        Fetches a leases endpoint (JSON or dnsmasq-style text) and parses it.
+
+    Returns a list of client dicts similar to get_active_clients(), with
+    additional keys: `rx_bytes`, `tx_bytes`, `rx_human`, `tx_human`, `total_human`.
+    """
+    host = CONF.get("AP_SSH_HOST")
+    user = CONF.get("AP_SSH_USER")
+    key = CONF.get("AP_SSH_KEY")
+    port = CONF.get("AP_SSH_PORT")
+    leases_url = CONF.get("AP_API_LEASES_URL")
+
+    leases_map = {}
+    stations = {}
+
+    # Method 1: SSH to AP and cat leases + iw station dump
+    if host and user:
+        ssh_base = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+        if key:
+            ssh_base.extend(["-i", str(key)])
+        if port:
+            ssh_base.extend(["-p", str(port)])
+        dest = f"{user}@{host}"
+
+        # Try to read dnsmasq leases on AP
+        leases_cmd = ssh_base + [dest, "cat /var/lib/misc/dnsmasq.leases || true"]
+        leases_out = _run(leases_cmd, fallback="")
+        leases_map = _parse_dnsmasq_leases(leases_out)
+
+        # Try to get station/usage via iw (common on OpenWrt/hostapd systems)
+        iw_cmd = ssh_base + [dest, "iw dev wlan0 station dump || true"]
+        iw_out = _run(iw_cmd, fallback="")
+        if iw_out:
+            current_mac = None
+            for line in iw_out.splitlines():
+                m = re.search(r"Station\s+([0-9a-f:]{17})", line, re.I)
+                if m:
+                    current_mac = m.group(1).lower()
+                    stations[current_mac] = {"mac": current_mac, "rx_bytes": 0, "tx_bytes": 0}
+                    continue
+                if current_mac:
+                    mrx = re.search(r"rx bytes:\s*(\d+)", line)
+                    mtx = re.search(r"tx bytes:\s*(\d+)", line)
+                    if mrx:
+                        stations[current_mac]["rx_bytes"] = int(mrx.group(1))
+                    if mtx:
+                        stations[current_mac]["tx_bytes"] = int(mtx.group(1))
+
+    # Method 2: API leases URL (JSON or dnsmasq text)
+    if leases_url and not leases_map:
+        try:
+            status, payload = _http_json(leases_url)
+            if status == 200 and isinstance(payload, list):
+                # Expecting list of {mac, ip, hostname}
+                for item in payload:
+                    mac = (item.get("mac") or "").lower()
+                    if not mac: continue
+                    leases_map[mac] = {"ip": item.get("ip"), "mac": mac, "hostname": item.get("hostname", "(unknown)"), "lease_remaining": item.get("lease_remaining", -1)}
+            else:
+                # Try plain text parse
+                if isinstance(payload, dict):
+                    # Not expected; skip
+                    pass
+        except Exception:
+            # Fallback: attempt raw fetch
+            try:
+                out = _run(["curl", "-s", "--max-time", "5", leases_url], fallback="")
+                leases_map = _parse_dnsmasq_leases(out)
+            except Exception:
+                pass
+
+    # Merge leases_map + stations into result list
+    results = []
+    seen = set()
+    for mac, s in {**stations}.items():
+        mac_l = mac.lower()
+        seen.add(mac_l)
+        lease = leases_map.get(mac_l, {})
+        rx = s.get("rx_bytes", 0) or 0
+        tx = s.get("tx_bytes", 0) or 0
+        client = {
+            "mac": mac_l,
+            "ip": lease.get("ip"),
+            "hostname": lease.get("hostname", "(unknown)"),
+            "lease_remaining": lease.get("lease_remaining", -1),
+            "rx_bytes": rx,
+            "tx_bytes": tx,
+            "rx_human": _human_bytes(rx),
+            "tx_human": _human_bytes(tx),
+            "total_human": _human_bytes(rx + tx),
+        }
+        results.append(client)
+
+    # Add any leases that didn't appear in station dump (e.g., sleeping devices)
+    for mac, lease in leases_map.items():
+        if mac in seen:
+            continue
+        results.append({
+            "mac": mac,
+            "ip": lease.get("ip"),
+            "hostname": lease.get("hostname", "(unknown)"),
+            "lease_remaining": lease.get("lease_remaining", -1),
+            "rx_bytes": 0,
+            "tx_bytes": 0,
+            "rx_human": _human_bytes(0),
+            "tx_human": _human_bytes(0),
+            "total_human": _human_bytes(0),
+        })
+
+    return results
 
 
 def get_system_stats() -> dict:
@@ -243,7 +543,7 @@ get_system_stats._prev_cpu = None
 
 
 def get_pihole_stats() -> dict:
-    """Fetch Pi-hole summary statistics via its local API."""
+    """Fetch Pi-hole summary statistics via Pi-hole API (v5/v6 compatible)."""
     default = {
         "enabled": False,
         "status": "disabled",
@@ -257,26 +557,133 @@ def get_pihole_stats() -> dict:
     if CONF.get("PIHOLE_ENABLED", "false").lower() != "true":
         return default
 
-    try:
-        import urllib.request
-        url = CONF["PIHOLE_API"] + "?summary"
-        with urllib.request.urlopen(url, timeout=3) as resp:
-            data = json.loads(resp.read().decode())
+    api_base = (CONF.get("PIHOLE_API") or "http://localhost/api").strip()
 
-        return {
-            "enabled": data.get("status") == "enabled",
-            "status": data.get("status", "unknown"),
-            "domains_blocked": data.get("domains_being_blocked", 0),
-            "queries_today": data.get("dns_queries_today", 0),
-            "ads_blocked_today": data.get("ads_blocked_today", 0),
-            "ads_percentage_today": round(
-                float(data.get("ads_percentage_today", 0)), 1
-            ),
-            "unique_clients": data.get("unique_clients", 0),
-        }
+    try:
+        # Pi-hole v6 API lives at /api and uses session-based auth.
+        if api_base.rstrip("/").endswith("/admin/api.php"):
+            parsed = urllib.parse.urlsplit(api_base)
+            api_base = urllib.parse.urlunsplit(
+                (parsed.scheme, parsed.netloc, "/api", "", "")
+            )
+
+        if api_base.rstrip("/").endswith("/api"):
+            return _get_pihole_stats_v6(api_base, default)
+
+        return _get_pihole_stats_legacy(api_base, default)
     except Exception as exc:
         log.warning("Pi-hole API error: %s", exc)
         return {**default, "status": "error", "error": "Pi-hole API unavailable"}
+
+
+def _http_json(url: str, *, timeout: int = 3, method: str = "GET",
+               headers: dict | None = None, body: dict | None = None) -> tuple[int, dict]:
+    req_headers = {"Accept": "application/json"}
+    if headers:
+        req_headers.update(headers)
+
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        req_headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8") or "{}")
+            return resp.status, payload
+    except urllib.error.HTTPError as err:
+        try:
+            payload = json.loads(err.read().decode("utf-8") or "{}")
+        except Exception:
+            payload = {}
+        return err.code, payload
+
+
+def _resolve_pihole_password() -> str:
+    conf_pw = (CONF.get("PIHOLE_PASSWORD") or "").strip()
+    if conf_pw:
+        return conf_pw
+
+    cli_pw = Path("/etc/pihole/cli_pw")
+    if cli_pw.exists():
+        try:
+            return cli_pw.read_text(errors="replace").strip()
+        except Exception:
+            return ""
+    return ""
+
+
+def _get_pihole_stats_v6(api_base: str, default: dict) -> dict:
+    status_code, auth_info = _http_json(f"{api_base.rstrip('/')}/auth")
+    session = auth_info.get("session") or {}
+    sid = session.get("sid")
+
+    if status_code == 401 or not session.get("valid", False):
+        password = _resolve_pihole_password()
+        if not password:
+            return {
+                **default,
+                "status": "auth_required",
+                "error": "Pi-hole API password required",
+            }
+        status_code, login = _http_json(
+            f"{api_base.rstrip('/')}/auth",
+            method="POST",
+            body={"password": password},
+        )
+        if status_code != 200:
+            return {
+                **default,
+                "status": "auth_failed",
+                "error": "Pi-hole API authentication failed",
+            }
+        sid = (login.get("session") or {}).get("sid")
+
+    headers = {}
+    if sid:
+        headers["sid"] = sid
+
+    status_code, summary = _http_json(
+        f"{api_base.rstrip('/')}/stats/summary",
+        headers=headers,
+    )
+    if status_code != 200:
+        raise RuntimeError(f"Pi-hole v6 summary request failed ({status_code})")
+
+    queries = summary.get("queries") or {}
+    clients = summary.get("clients") or {}
+    gravity = summary.get("gravity") or {}
+
+    return {
+        "enabled": True,
+        "status": "enabled",
+        "domains_blocked": gravity.get("domains_being_blocked", 0),
+        "queries_today": queries.get("total", 0),
+        "ads_blocked_today": queries.get("blocked", 0),
+        "ads_percentage_today": round(float(queries.get("percent_blocked", 0) or 0), 1),
+        "unique_clients": clients.get("active", 0),
+    }
+
+
+def _get_pihole_stats_legacy(api_base: str, default: dict) -> dict:
+    url = api_base
+    if "?" not in url:
+        joiner = "&" if url.endswith("/") else "?"
+        url = f"{url}{joiner}summary"
+    status_code, data = _http_json(url)
+    if status_code != 200:
+        raise RuntimeError(f"Pi-hole legacy summary request failed ({status_code})")
+
+    return {
+        "enabled": data.get("status") == "enabled",
+        "status": data.get("status", "unknown"),
+        "domains_blocked": data.get("domains_being_blocked", 0),
+        "queries_today": data.get("dns_queries_today", 0),
+        "ads_blocked_today": data.get("ads_blocked_today", 0),
+        "ads_percentage_today": round(float(data.get("ads_percentage_today", 0) or 0), 1),
+        "unique_clients": data.get("unique_clients", 0),
+    }
 
 
 def get_recent_errors(n: int = 20) -> list:
@@ -320,9 +727,13 @@ def api_stats():
     system = get_system_stats()
     pihole = get_pihole_stats()
     errors = get_recent_errors()
+    health = get_health_checks()
 
     wan_iface = CONF["WAN_IFACE"]
     lan_iface = CONF["LAN_IFACE"]
+
+    # Update bandwidth history for trends
+    bandwidth_history.update(speeds.get(wan_iface, {}), speeds.get(lan_iface, {}))
 
     return jsonify({
         "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
@@ -336,6 +747,7 @@ def api_stats():
         "system": system,
         "pihole": pihole,
         "recent_errors": errors,
+        "health": health,
     })
 
 
@@ -357,6 +769,22 @@ def api_speeds():
 @app.route("/api/system")
 def api_system():
     return jsonify(get_system_stats())
+
+
+@app.route("/api/trends")
+def api_trends():
+    """Return bandwidth trend history (rolling 1-hour)."""
+    history = bandwidth_history.get_history()
+    return jsonify({
+        "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "trends": history,
+    })
+
+
+@app.route("/api/health")
+def api_health():
+    """Return gateway and DNS health checks."""
+    return jsonify(get_health_checks())
 
 
 if __name__ == "__main__":

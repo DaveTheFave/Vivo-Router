@@ -21,6 +21,14 @@
     <span class="logo-sub">Dashboard</span>
   </div>
   <div class="header-right">
+    <span class="health-badge">
+      <span class="health-dot" id="health-gateway">◦</span>
+      Gateway: <strong id="health-gateway-status">–</strong>
+    </span>
+    <span class="health-badge">
+      <span class="health-dot" id="health-dns">◦</span>
+      DNS: <strong id="health-dns-status">–</strong>
+    </span>
     <span class="wan-badge">
       <span class="dot" id="wan-dot"></span>
       WAN: <strong id="wan-ip">–</strong>
@@ -162,6 +170,20 @@
           <tr><td colspan="3" class="empty-row">Loading…</td></tr>
         </tbody>
       </table>
+      
+      <!-- Bandwidth trends chart -->
+      <div class="trends-container">
+        <div class="trends-header">
+          <span class="trends-title">📈 Last 1 Hour</span>
+        </div>
+        <canvas id="bandwidth-chart" width="400" height="150" class="bandwidth-chart"></canvas>
+        <div class="trends-legend">
+          <span class="legend-item"><span class="legend-color" style="background: #FF6B6B;"></span> WAN RX</span>
+          <span class="legend-item"><span class="legend-color" style="background: #4ECDC4;"></span> WAN TX</span>
+          <span class="legend-item"><span class="legend-color" style="background: #95E1D3;"></span> LAN RX</span>
+          <span class="legend-item"><span class="legend-color" style="background: #FFE66D;"></span> LAN TX</span>
+        </div>
+      </div>
     </div>
 
   </div><!-- /.col-left -->
@@ -178,15 +200,17 @@
       <div class="table-scroll">
         <table class="client-table">
           <thead>
-            <tr>
-              <th>Hostname</th>
-              <th>IP Address</th>
-              <th>MAC Address</th>
-              <th>Lease</th>
-            </tr>
+              <tr>
+                <th>Hostname</th>
+                <th>IP Address</th>
+                <th>MAC Address</th>
+                <th>Upload</th>
+                <th>Download</th>
+                <th>Lease</th>
+              </tr>
           </thead>
           <tbody id="client-tbody">
-            <tr><td colspan="4" class="empty-row">No active leases found</td></tr>
+              <tr><td colspan="6" class="empty-row">No active leases found</td></tr>
           </tbody>
         </table>
       </div>

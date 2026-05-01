@@ -107,6 +107,26 @@ python3 -m venv .venv
 
 Then open **http://localhost:5000** in a browser.
 
+### Pi-hole API password via .env
+
+If your Pi-hole API requires authentication (Pi-hole v6), set the password in:
+
+```bash
+cp dashboard/.env.example dashboard/.env
+```
+
+Then edit `dashboard/.env` and set:
+
+```bash
+PIHOLE_PASSWORD=your-pihole-admin-password
+```
+
+Restart the dashboard service after updating `.env`:
+
+```bash
+sudo systemctl restart vivo-router-dashboard
+```
+
 ---
 
 ## Service Management

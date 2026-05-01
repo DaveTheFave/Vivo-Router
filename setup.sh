@@ -172,101 +172,6 @@ fi
 
 success "Packages installed."
 
-# -- Step X - 6to4 IPv6 tunneling (optional) ───────────────────────────────────────────────
-
-echo ""
-hr
-echo -e "${BOLD}STEP X — IPv6 (6to4) Auto‑Configuration${NC}"
-hr
-echo ""
-
-info "Setting up dynamic 6to4 IPv6…"
-
-# 6to4 prefix is 2002:W.X.Y.Z::/48 where W.X.Y.Z is WAN IPv4
-WAN_IPV4=$(curl -4 -s https://ifconfig.me || true)
-
-if [[ -z "$WAN_IPV4" ]]; then
-    warn "Could not detect WAN IPv4; skipping 6to4 setup."
-else
-    info "Detected WAN IPv4: ${WAN_IPV4}"
-
-    # Convert IPv4 to hex for 6to4 prefix
-    IFS=. read -r o1 o2 o3 o4 <<< "$WAN_IPV4"
-    HEX_PREFIX=$(printf "%02x%02x:%02x%02x" "$o1" "$o2" "$o3" "$o4")
-    SIXTO4_PREFIX="2002:${HEX_PREFIX}::/48"
-
-    info "Computed 6to4 prefix: ${SIXTO4_PREFIX}"
-
-    # Assign LAN IPv6 (2002:xxxx:xxxx:1::1/64)
-    info "Priming 6to4 state via updater…"
-    /usr/local/bin/vivo-6to4-update || warn "Initial 6to4 update failed; timer will retry."
-
-
-    # Persist via systemd service
-    SIXTO4_SERVICE="/etc/systemd/system/vivo-6to4.service"
-    SIXTO4_TIMER="/etc/systemd/system/vivo-6to4.timer"
-
-    cat > "$SIXTO4_SERVICE" <<EOF
-[Unit]
-Description=Dynamic 6to4 IPv6 updater
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/vivo-6to4-update
-
-EOF
-
-    cat > "$SIXTO4_TIMER" <<EOF
-[Unit]
-Description=Run 6to4 updater every 5 minutes
-
-[Timer]
-OnBootSec=30
-OnUnitActiveSec=300
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    # Write updater script
-    cat > /usr/local/bin/vivo-6to4-update <<EOF
-#!/usr/bin/env bash
-set -e
-
-WAN_IFACE="${WAN_IFACE}"
-LAN_IFACE="${LAN_IFACE}"
-
-WAN_IPV4=\$(ip -4 addr show \$WAN_IFACE | awk '/inet /{print \$2}' | cut -d/ -f1)
-[[ -z "\$WAN_IPV4" ]] && exit 0
-
-IFS=. read -r o1 o2 o3 o4 <<< "\$WAN_IPV4"
-HEX_PREFIX=\$(printf "%02x%02x:%02x%02x" "\$o1" "\$o2" "\$o3" "\$o4")
-PREFIX="2002:\${HEX_PREFIX}"
-
-LAN_IPV6="\${PREFIX}:1::1/64"
-
-ip -6 addr flush dev "\$LAN_IFACE" scope global || true
-ip -6 addr add "\$LAN_IPV6" dev "\$LAN_IFACE" || true
-
-# Update dnsmasq RA prefix
-sed -i "s|^#*dhcp-range=.*ra-only|dhcp-range=\${PREFIX}:1::100,\${PREFIX}:1::1ff,64,ra-only|" /etc/dnsmasq.d/vivo-router.conf
-sed -i "s|^#*enable-ra|enable-ra|" /etc/dnsmasq.d/vivo-router.conf
-
-systemctl restart dnsmasq || true
-EOF
-
-    chmod +x /usr/local/bin/vivo-6to4-update
-
-    /usr/local/bin/vivo-6to4-update || true
-
-    systemctl daemon-reload
-    systemctl enable vivo-6to4.timer >/dev/null 2>&1
-    systemctl start vivo-6to4.timer
-
-    success "6to4 IPv6 automation installed."
-fi
-
 # ── step 4 – configure static IP on LAN interface ────────────────────────────
 echo ""
 hr
@@ -319,24 +224,34 @@ cat > "$NFT_CONF" <<EOF
 flush ruleset
 
 table inet filter {
+
+    # ── Flowtable: bypasses netfilter for established flows ──────────────────
+    flowtable ft {
+        hook ingress priority 0;
+        devices = { ${LAN_IFACE}, ${WAN_IFACE} };
+    }
+
     chain input {
         type filter hook input priority 0;
         policy drop;
 
-        # Allow loopback
+        # Loopback
         iif lo accept
 
-        # Allow established/related
+        # Established/related
         ct state established,related accept
+
+        # Drop invalid packets early
+        ct state invalid drop
 
         # Allow LAN to router
         iifname "${LAN_IFACE}" accept
 
-        # Allow essential ICMP/ICMPv6
-        ip protocol icmp accept
-        ip6 nexthdr icmpv6 accept
+        # ICMP (rate-limited to prevent flood)
+        ip protocol icmp limit rate 10/second accept
+        ip6 nexthdr icmpv6 limit rate 10/second accept
 
-        # Allow SSH from LAN only (optional)
+        # SSH from LAN only
         tcp dport 22 iifname "${LAN_IFACE}" accept
     }
 
@@ -344,39 +259,52 @@ table inet filter {
         type filter hook forward priority 0;
         policy drop;
 
-        # Allow established/related
+        # Flowtable offload: established TCP/UDP skips the rest of this chain
+        ip protocol { tcp, udp } flow add @ft
+
+        # Established/related (catches non-offloaded or first packets)
         ct state established,related accept
 
-        # Allow LAN -> WAN (IPv4 + IPv6)
+        # Drop invalid
+        ct state invalid drop
+
+        # LAN -> WAN
         iifname "${LAN_IFACE}" oifname "${WAN_IFACE}" accept
 
-        # (Optional) allow LAN -> LAN (if multiple LAN segments later)
+        # LAN -> LAN (future segments)
         iifname "${LAN_IFACE}" oifname "${LAN_IFACE}" accept
+
+        # Port forward targets - allow forwarded traffic to reach LAN hosts
+        ip daddr 192.168.1.54 tcp dport { 2323, 8920 } accept
+        ip daddr 192.168.1.88 tcp dport 2222 accept
     }
 
     chain output {
         type filter hook output priority 0;
         policy accept;
+
+        # Drop invalid outbound
+        ct state invalid drop
     }
 }
 
+# ── IPv4 NAT ─────────────────────────────────────────────────────────────────
 table ip nat {
+    chain prerouting {
+        type nat hook prerouting priority -100;
+
+        # Port forwards from WAN
+        iifname "${WAN_IFACE}" tcp dport 2323 dnat to 192.168.1.54
+        iifname "${WAN_IFACE}" tcp dport 8920 dnat to 192.168.1.54
+        iifname "${WAN_IFACE}" tcp dport 2222 dnat to 192.168.1.88
+    }
+
     chain postrouting {
         type nat hook postrouting priority 100;
         policy accept;
 
         # IPv4 masquerade LAN -> WAN
         oifname "${WAN_IFACE}" ip saddr ${LAN_SUBNET} masquerade
-    }
-}
-
-table ip6 nat {
-    chain postrouting {
-        type nat hook postrouting priority 100;
-        policy accept;
-
-        # IPv6 masquerade LAN -> WAN (6to4 and any other global IPv6)
-        oifname "${WAN_IFACE}" masquerade
     }
 }
 EOF
@@ -417,10 +345,6 @@ dhcp-option=option:dns-server,${LAN_IP}
 # Upstream DNS (used when Pi-hole is not installed)
 server=${DNS1}
 server=${DNS2}
-
-# IPv6 RA (router advertisements) - template for 6to4 updater
-# enable-ra
-# dhcp-range=2002:XXXX:XXXX:1::100,2002:XXXX:XXXX:1::1ff,64,ra-only
 
 # Logging (used by the dashboard to show errors)
 log-dhcp
@@ -514,7 +438,7 @@ WAN_IFACE=${WAN_IFACE}
 LAN_IFACE=${LAN_IFACE}
 LAN_IP=${LAN_IP}
 PIHOLE_ENABLED=${INSTALL_PIHOLE}
-PIHOLE_API=http://localhost/admin/api.php
+PIHOLE_API=http://localhost/admin/api
 EOF
 
 info "Installing systemd service for dashboard…"
