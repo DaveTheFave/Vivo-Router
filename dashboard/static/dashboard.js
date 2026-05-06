@@ -206,33 +206,187 @@ function clearErrors() {
 
 // ── health checks ─────────────────────────────────────────────────────────────
 function renderHealth(data) {
-  // Extract health info from /api/stats response
   const health = data.health || {};
-  
-  // Gateway health
-  const gwStatus = health.gateway || {};
+
+  // Header dots (gateway + DNS)
+  const gw = health.gateway || {};
   const gwDot = document.getElementById("health-gateway");
   const gwStatusEl = document.getElementById("health-gateway-status");
   if (gwDot && gwStatusEl) {
-    gwDot.className = "health-dot " + (gwStatus.status || "unknown");
-    let text = gwStatus.status === "up" 
-      ? (gwStatus.response_time_ms ? gwStatus.response_time_ms + "ms" : "up")
-      : (gwStatus.status || "–");
-    gwStatusEl.textContent = text;
+    gwDot.className = "health-dot " + (gw.status || "unknown");
+    gwStatusEl.textContent = gw.status === "up"
+      ? (gw.response_time_ms ? gw.response_time_ms + "ms" : "up")
+      : (gw.status || "–");
   }
-  
-  // DNS health
-  const dnsStatus = health.dns || {};
+
+  const dns = health.dns || {};
   const dnsDot = document.getElementById("health-dns");
   const dnsStatusEl = document.getElementById("health-dns-status");
   if (dnsDot && dnsStatusEl) {
-    dnsDot.className = "health-dot " + (dnsStatus.status || "unknown");
-    let text = dnsStatus.status === "ok"
-      ? (dnsStatus.response_time_ms ? dnsStatus.response_time_ms + "ms" : "ok")
-      : (dnsStatus.status || "–");
-    dnsStatusEl.textContent = text;
+    dnsDot.className = "health-dot " + (dns.status || "unknown");
+    dnsStatusEl.textContent = dns.status === "ok"
+      ? (dns.response_time_ms ? dns.response_time_ms + "ms" : "ok")
+      : (dns.status || "–");
+  }
+
+  // Full network health panel
+  renderNetworkHealth(health);
+}
+
+function renderNetworkHealth(health) {
+  const gw   = health.gateway  || {};
+  const isp  = health.isp      || {};
+  const dns  = health.dns      || {};
+  const ap   = health.ap       || {};
+  const diag = health.diagnosis || {};
+
+  // Overall badge
+  const badge = document.getElementById("nh-overall-badge");
+  if (badge) {
+    const overall = diag.overall || "ok";
+    badge.className = "nh-badge nh-" + overall;
+    badge.textContent = overall === "ok"       ? "All Systems OK"
+                      : overall === "warning"  ? "Warning"
+                      :                          "Fault Detected";
+  }
+
+  // Issue messages
+  const issuesEl = document.getElementById("nh-issues");
+  if (issuesEl) {
+    const issues  = diag.issues  || [];
+    const overall = diag.overall || "ok";
+    if (issues.length === 0) {
+      issuesEl.innerHTML = "";
+    } else {
+      issuesEl.innerHTML = issues.map(msg =>
+        `<div class="nh-issue${overall === "warning" ? " warn" : ""}">${escHtml(msg)}</div>`
+      ).join("");
+    }
+  }
+
+  // Row helper
+  function setRow(dotId, valId, statusClass, valueText) {
+    const dot = document.getElementById(dotId);
+    const val = document.getElementById(valId);
+    if (dot) dot.className = "nh-dot " + statusClass;
+    if (val) val.textContent = valueText;
+  }
+
+  // Gateway
+  setRow("ndot-gateway", "nval-gateway",
+    gw.status === "up" ? "up" : (gw.status === "unknown" ? "unknown" : "down"),
+    gw.status === "up"
+      ? (gw.response_time_ms ? gw.response_time_ms + " ms" : "up")
+      : (gw.status === "unknown" ? "checking…" : "Unreachable")
+  );
+
+  // ISP
+  setRow("ndot-isp", "nval-isp",
+    isp.status === "up" ? "up" : (isp.status === "down" ? "down" : "unknown"),
+    isp.status === "up"
+      ? (isp.response_time_ms ? isp.response_time_ms + " ms" : "up")
+      : (isp.status === "down" ? "Down" : "checking…")
+  );
+
+  // DNS
+  setRow("ndot-dns", "nval-dns",
+    dns.status === "ok" ? "up" : (dns.status === "failed" ? "down" : "unknown"),
+    dns.status === "ok"
+      ? (dns.response_time_ms ? dns.response_time_ms + " ms" : "ok")
+      : (dns.status === "failed" ? "Failed" : (dns.status || "–"))
+  );
+
+  // AP
+  const apRow = document.getElementById("nrow-ap");
+  if (ap.status === "disabled" || ap.status === "unconfigured") {
+    if (apRow) apRow.style.opacity = "0.4";
+    setRow("ndot-ap", "nval-ap", "disabled", "Not configured");
+  } else {
+    if (apRow) apRow.style.opacity = "1";
+    setRow("ndot-ap", "nval-ap",
+      ap.status === "up" ? "up" : (ap.status === "down" ? "down" : "unknown"),
+      ap.status === "up"
+        ? (ap.response_time_ms ? ap.response_time_ms + " ms" : "up")
+        : (ap.status === "down" ? "No Connection" : (ap.status || "–"))
+    );
   }
 }
+
+// ── power / battery monitoring ─────────────────────────────────────────────────
+let _powerAlertDismissed = false;
+
+function _updateBatteryBadge(battery) {
+  const badge  = document.getElementById("battery-badge");
+  const icon   = document.getElementById("battery-icon");
+  const pctEl  = document.getElementById("battery-pct");
+  if (!badge) return;
+
+  const pct = Math.round(battery.level * 100);
+  badge.style.display = "";  // make it visible
+  if (pctEl) pctEl.textContent = pct + "%";
+
+  badge.classList.remove("charging", "low");
+  if (battery.charging) {
+    badge.classList.add("charging");
+    if (icon) icon.textContent = "⚡";
+  } else {
+    if (pct <= 20) badge.classList.add("low");
+    if (icon) icon.textContent = "🔋";
+  }
+}
+
+function _showPowerAlert(battery) {
+  if (_powerAlertDismissed) return;
+  const el     = document.getElementById("power-alert");
+  const detail = document.getElementById("power-alert-detail");
+  if (!el) return;
+  if (detail) {
+    const pct = Math.round(battery.level * 100);
+    detail.textContent = `Running on battery (${pct}%). AC power has been disconnected.`;
+  }
+  el.classList.add("visible");
+}
+
+function _hidePowerAlert() {
+  const el = document.getElementById("power-alert");
+  if (el) el.classList.remove("visible");
+}
+
+function dismissPowerAlert() {
+  _powerAlertDismissed = true;
+  _hidePowerAlert();
+}
+
+async function initBatteryMonitor() {
+  if (!("getBattery" in navigator)) return;
+  try {
+    const battery = await navigator.getBattery();
+
+    // Update the header badge immediately and on every change
+    _updateBatteryBadge(battery);
+    battery.addEventListener("levelchange",   () => _updateBatteryBadge(battery));
+    battery.addEventListener("chargingchange", () => {
+      _updateBatteryBadge(battery);
+      if (battery.charging) {
+        // AC restored — hide alert and allow it to show again next time
+        _hidePowerAlert();
+        _powerAlertDismissed = false;
+      } else {
+        // AC just disconnected — show immediately
+        _showPowerAlert(battery);
+      }
+    });
+
+    // Delay the initial on-load check by 10 s so the browser has time to
+    // correctly read the hardware charging state (avoids false positives).
+    setTimeout(() => {
+      if (!battery.charging) _showPowerAlert(battery);
+    }, 10000);
+
+  } catch (_) { /* Battery API unavailable */ }
+}
+
+initBatteryMonitor();
 
 // ── bandwidth trends chart ────────────────────────────────────────────────────
 async function renderTrends() {

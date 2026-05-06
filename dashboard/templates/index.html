@@ -34,6 +34,9 @@
       WAN: <strong id="wan-ip">–</strong>
     </span>
     <span class="uptime-badge">Up: <strong id="uptime">–</strong></span>
+    <span class="battery-badge" id="battery-badge">
+      <span id="battery-icon">🔋</span> <strong id="battery-pct">–</strong>
+    </span>
     <span class="clock" id="clock"></span>
   </div>
 </header>
@@ -96,6 +99,37 @@
 
   <!-- ── Row 2: left column ───────────────────────────────────────────────── -->
   <div class="col-left">
+
+    <!-- Network Health panel -->
+    <div class="panel" id="network-health-panel">
+      <div class="panel-header">
+        <span class="panel-title">🌐 Network Health</span>
+        <span class="nh-badge nh-checking" id="nh-overall-badge">Checking…</span>
+      </div>
+      <div class="nh-issues" id="nh-issues"></div>
+      <div class="nh-rows">
+        <div class="nh-row">
+          <span class="nh-dot" id="ndot-gateway"></span>
+          <span class="nh-label">Gateway</span>
+          <span class="nh-value" id="nval-gateway">–</span>
+        </div>
+        <div class="nh-row">
+          <span class="nh-dot" id="ndot-isp"></span>
+          <span class="nh-label">ISP / Internet</span>
+          <span class="nh-value" id="nval-isp">–</span>
+        </div>
+        <div class="nh-row">
+          <span class="nh-dot" id="ndot-dns"></span>
+          <span class="nh-label">DNS</span>
+          <span class="nh-value" id="nval-dns">–</span>
+        </div>
+        <div class="nh-row" id="nrow-ap">
+          <span class="nh-dot" id="ndot-ap"></span>
+          <span class="nh-label">Access Point</span>
+          <span class="nh-value" id="nval-ap">–</span>
+        </div>
+      </div>
+    </div>
 
     <!-- Pi-hole panel -->
     <div class="panel" id="pihole-panel">
@@ -237,6 +271,16 @@
   <span id="last-updated">Last updated: –</span>
   <span>Refresh: <strong>5s</strong></span>
 </footer>
+
+<!-- Power Loss Banner -->
+<div class="power-alert" id="power-alert">
+  <span class="power-alert-icon">⚡</span>
+  <div class="power-alert-content">
+    <strong>AC Power Lost</strong>
+    <span id="power-alert-detail">Running on battery — AC power has been disconnected.</span>
+  </div>
+  <button class="power-alert-dismiss" onclick="dismissPowerAlert()">✕</button>
+</div>
 
 <script src="/static/dashboard.js"></script>
 </body>

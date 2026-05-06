@@ -509,6 +509,145 @@ main.grid {
   height: 12px;
   border-radius: 2px;
 }
+/* ── network health panel ─────────────────────────────────────────────────── */
+.nh-badge {
+  font-size: .75rem;
+  font-weight: 700;
+  padding: 2px 10px;
+  border-radius: 20px;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+}
+.nh-ok       { background: var(--green);    color: #000; }
+.nh-warning  { background: var(--yellow);   color: #000; }
+.nh-critical { background: var(--red);      color: #fff; }
+.nh-checking { background: var(--surface2); color: var(--text-muted); border: 1px solid var(--border); }
+
+.nh-issues {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+  empty-cells: hide;
+}
+.nh-issues:empty { margin-bottom: 0; }
+
+.nh-issue {
+  background: rgba(248, 81, 73, 0.1);
+  border: 1px solid rgba(248, 81, 73, 0.35);
+  border-radius: 5px;
+  padding: 6px 10px;
+  font-size: .82rem;
+  color: var(--red);
+  line-height: 1.4;
+}
+.nh-issue.warn {
+  background: rgba(227, 179, 65, 0.1);
+  border-color: rgba(227, 179, 65, 0.35);
+  color: var(--yellow);
+}
+
+.nh-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.nh-row {
+  display: grid;
+  grid-template-columns: 12px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--surface2);
+  border-radius: 5px;
+  font-size: .84rem;
+  transition: opacity .2s;
+}
+
+.nh-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  display: inline-block;
+  flex-shrink: 0;
+}
+.nh-dot.up, .nh-dot.ok      { background: var(--green);      animation: pulse 2s infinite; }
+.nh-dot.down, .nh-dot.error,
+.nh-dot.failed               { background: var(--red);        animation: none; }
+.nh-dot.warning              { background: var(--yellow);     animation: none; }
+.nh-dot.unknown              { background: var(--yellow);     animation: none; }
+.nh-dot.disabled             { background: var(--border);     animation: none; }
+
+.nh-label { color: var(--text-muted); }
+
+.nh-value {
+  font-size: .78rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* ── battery badge (header) ───────────────────────────────────────────────── */
+.battery-badge {
+  font-size: .82rem;
+  color: var(--text-muted);
+  display: none; /* shown once Battery API responds */
+}
+.battery-badge strong { color: var(--text); }
+.battery-badge.charging strong { color: var(--green); }
+.battery-badge.low     strong { color: var(--red); }
+
+/* ── power alert banner ───────────────────────────────────────────────────── */
+.power-alert {
+  position: fixed;
+  bottom: 44px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #2d1b00;
+  border: 2px solid var(--orange);
+  border-radius: var(--radius);
+  padding: 12px 18px;
+  align-items: center;
+  gap: 12px;
+  box-shadow: 0 4px 24px rgba(0,0,0,.6);
+  z-index: 1000;
+  min-width: 320px;
+  max-width: 500px;
+  display: none; /* hidden by default; JS adds .visible to show */
+}
+.power-alert.visible {
+  display: flex;
+  animation: slideUp .25s ease;
+}
+
+@keyframes slideUp {
+  from { transform: translateX(-50%) translateY(16px); opacity: 0; }
+  to   { transform: translateX(-50%) translateY(0);    opacity: 1; }
+}
+
+.power-alert-icon { font-size: 1.5rem; flex-shrink: 0; }
+
+.power-alert-content { flex: 1; }
+.power-alert-content strong { display: block; color: var(--orange); font-size: .9rem; }
+.power-alert-content span   { font-size: .8rem; color: var(--text-muted); }
+
+.power-alert-dismiss {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: .75rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.power-alert-dismiss:hover { border-color: var(--orange); color: var(--orange); }
+
 /* ── status bar / footer ─────────────────────────────────────────────────── */
 footer.statusbar {
   display: flex;

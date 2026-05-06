@@ -13,6 +13,7 @@ import logging
 import urllib.error
 import urllib.parse
 import urllib.request
+import concurrent.futures
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import deque
@@ -274,11 +275,112 @@ def get_dns_health() -> dict:
         return {"status": "error", "response_time_ms": None, "error": str(exc)}
 
 
+def get_isp_health() -> dict:
+    """Check internet reachability by pinging known external IPs (no DNS required)."""
+    test_ips = ["1.1.1.1", "8.8.8.8"]
+    for ip in test_ips:
+        try:
+            result = subprocess.run(
+                ["ping", "-c", "1", "-W", "2", ip],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                match = re.search(r"time=([0-9.]+)\s*ms", result.stdout)
+                response_time = float(match.group(1)) if match else None
+                return {
+                    "status": "up",
+                    "tested_ip": ip,
+                    "response_time_ms": round(response_time, 1) if response_time else None,
+                }
+        except Exception:
+            continue
+    return {"status": "down", "tested_ip": test_ips[0], "response_time_ms": None}
+
+
+def get_ap_health() -> dict:
+    """Ping the configured AP to check reachability."""
+    if CONF.get("AP_ENABLED", "false").lower() != "true":
+        return {"status": "disabled"}
+    ap_ip = CONF.get("AP_IP", "").strip()
+    if not ap_ip:
+        return {"status": "unconfigured"}
+    if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ap_ip):
+        return {"status": "error", "error": "Invalid AP_IP in config"}
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", "2", ap_ip],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            match = re.search(r"time=([0-9.]+)\s*ms", result.stdout)
+            response_time = float(match.group(1)) if match else None
+            return {
+                "status": "up",
+                "ap_ip": ap_ip,
+                "response_time_ms": round(response_time, 1) if response_time else None,
+            }
+        return {"status": "down", "ap_ip": ap_ip, "response_time_ms": None}
+    except Exception as exc:
+        log.warning("get_ap_health error: %s", exc)
+        return {"status": "error", "ap_ip": ap_ip, "error": str(exc)}
+
+
+def get_network_diagnosis(gateway: dict, isp: dict, dns: dict, ap: dict) -> dict:
+    """Correlate all health checks and assign a blame/fault label."""
+    issues = []
+    blame = "none"   # none | gateway | isp | dns | ap
+    overall = "ok"   # ok | warning | critical
+
+    gw_up  = gateway.get("status") == "up"
+    isp_up = isp.get("status") == "up"
+    dns_ok = dns.get("status") == "ok"
+    ap_status = ap.get("status")
+    ap_active = ap_status not in ("disabled", "unconfigured")
+
+    if not gw_up:
+        issues.append("Gateway unreachable — check your router or modem connection")
+        blame = "gateway"
+        overall = "critical"
+    elif not isp_up:
+        issues.append("ISP Down — gateway is reachable but the internet is not")
+        blame = "isp"
+        overall = "critical"
+
+    if gw_up and not dns_ok:
+        issues.append("DNS resolution is failing")
+        if overall == "ok":
+            overall = "warning"
+            blame = "dns"
+
+    if ap_active and ap_status != "up":
+        issues.append("No connection to AP — the access point is not responding")
+        if overall == "ok":
+            overall = "warning"
+        if blame == "none":
+            blame = "ap"
+
+    return {"overall": overall, "blame": blame, "issues": issues}
+
+
 def get_health_checks() -> dict:
-    """Return combined health status for gateway and DNS."""
+    """Run gateway, ISP, DNS, and AP checks in parallel and return combined status."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        f_gw  = ex.submit(get_gateway_health)
+        f_isp = ex.submit(get_isp_health)
+        f_dns = ex.submit(get_dns_health)
+        f_ap  = ex.submit(get_ap_health)
+        gateway = f_gw.result(timeout=8)
+        isp     = f_isp.result(timeout=8)
+        dns     = f_dns.result(timeout=8)
+        ap      = f_ap.result(timeout=8)
+
+    diagnosis = get_network_diagnosis(gateway, isp, dns, ap)
     return {
-        "gateway": get_gateway_health(),
-        "dns": get_dns_health(),
+        "gateway": gateway,
+        "isp": isp,
+        "dns": dns,
+        "ap": ap,
+        "diagnosis": diagnosis,
         "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
     }
 
