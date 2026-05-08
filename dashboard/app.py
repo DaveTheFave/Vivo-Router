@@ -18,7 +18,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from collections import deque
 
-from flask import Flask, jsonify, render_template, send_from_directory
+from flask import Flask, jsonify, render_template
 
 # ── configuration ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -132,15 +132,6 @@ def _run(cmd: list[str], fallback: str = "") -> str:
         return result.stdout.strip()
     except Exception:
         return fallback
-
-
-def _run_json(cmd: list[str]) -> dict | list | None:
-    """Run a command that returns JSON."""
-    out = _run(cmd)
-    try:
-        return json.loads(out)
-    except Exception:
-        return None
 
 
 # ── data collectors ───────────────────────────────────────────────────────────
@@ -519,260 +510,32 @@ def get_hostnames_batch(ips: list, timeout: float = 1.5, max_workers: int = 5) -
     return results
 
 
-def get_tplink_ap_clients() -> dict:
-    """Get connected clients from TP-Link Archer BE11000 AP via tplinkrouterc6u.
-
-    Returns dict mapping MAC -> {ip, hostname}.
-    Returns empty dict if AP not configured or connection fails.
-    """
-    if not CONF.get("AP_ENABLED", "false").lower() == "true":
-        return {}
-
-    try:
-        from tplinkrouterc6u import TplinkRouter
-
-        ap_ip = CONF.get("AP_IP")
-        ap_user = CONF.get("AP_USERNAME", "admin")
-        # Support both AP_PASSWORD and AP_PSW environment variable names
-        ap_pass = CONF.get("AP_PASSWORD") or CONF.get("AP_PSW") or ""
-        ap_timeout = int(CONF.get("AP_TIMEOUT", "5"))
-
-        if not (ap_ip and ap_pass):
-            log.debug("AP configured but missing AP_IP or AP_PASSWORD/AP_PSW")
-            return {}
-
-        router = TplinkRouter(
-            host=ap_ip,
-            username=ap_user,
-            password=ap_pass,
-            timeout=ap_timeout
-        )
-
-        # Authorize and get DHCP leases
-        router.authorize()
-        leases_data = router.get_ipv4_dhcp_leases()
-        router.logout()
-
-        # Parse DHCP leases into client dict
-        result = {}
-        if leases_data and isinstance(leases_data, dict):
-            lease_list = leases_data.get("lease_list", []) or leases_data.get("result", {}).get("lease_list", [])
-            for lease in lease_list:
-                mac = (lease.get("mac") or "").lower()
-                if not mac:
-                    continue
-                result[mac] = {
-                    "ip": lease.get("ipaddr"),
-                    "hostname": lease.get("hostname", "(unknown)"),
-                    "rx_bytes": 0,  # Not available from DHCP leases
-                    "tx_bytes": 0,
-                }
-
-        log.info("get_tplink_ap_clients: found %d clients on AP", len(result))
-        return result
-
-    except ImportError:
-        log.debug("tplinkrouterc6u not installed; AP client data unavailable")
-        return {}
-    except Exception as exc:
-        log.debug("get_tplink_ap_clients error: %s", exc)
-        return {}
 
 
 def get_active_clients() -> list:
-    """Discover active clients using ARP + parallel hostname resolution.
-
-    1. Scans /proc/net/arp for connected clients
-    2. Resolves hostnames in parallel (5 threads) using Avahi + reverse DNS
-    3. Merges with AP data from tplinkrouterc6u
-
-    Returns list of client dicts with: mac, ip, hostname, rx_bytes, tx_bytes,
-    rx_human, tx_human, total_human, lease_remaining.
-    """
+    """Discover active clients using ARP + parallel hostname resolution."""
     # Get clients from ARP table
     arp_clients = get_arp_clients()
     if not arp_clients:
         return []
 
-    # Get AP client data
-    ap_clients = get_tplink_ap_clients()
 
     # Resolve all hostnames in parallel (Avahi mDNS + reverse DNS fallback)
     ips = [client["ip"] for client in arp_clients.values()]
     hostnames = get_hostnames_batch(ips, timeout=1.5, max_workers=5)
 
-    # Update clients with resolved hostnames (only if not from AP)
-    for mac, client in arp_clients.items():
-        if mac not in ap_clients:
-            client["hostname"] = hostnames.get(client["ip"], "(unknown)")
+    # Update clients with resolved hostnames.
+    for client in arp_clients.values():
+        client["hostname"] = hostnames.get(client["ip"], "(unknown)")
 
-    # Build final client list
+    # Build final client list with normalized fields expected by the UI.
     clients = []
     for mac, arp_data in arp_clients.items():
-        if mac in ap_clients:
-            # Use AP data (has hostname, IP, and usage)
-            ap_data = ap_clients[mac]
-            rx = ap_data.get("rx_bytes", 0) or 0
-            tx = ap_data.get("tx_bytes", 0) or 0
-            clients.append({
-                "mac": mac,
-                "ip": ap_data.get("ip") or arp_data["ip"],
-                "hostname": ap_data.get("hostname", "(unknown)"),
-                "lease_remaining": -1,
-                "rx_bytes": rx,
-                "tx_bytes": tx,
-                "rx_human": _human_bytes(rx),
-                "tx_human": _human_bytes(tx),
-                "total_human": _human_bytes(rx + tx),
-            })
-        else:
-            # Use ARP data only
-            clients.append({
-                "mac": mac,
-                "ip": arp_data["ip"],
-                "hostname": arp_data["hostname"],
-                "lease_remaining": -1,
-                "rx_bytes": 0,
-                "tx_bytes": 0,
-                "rx_human": _human_bytes(0),
-                "tx_human": _human_bytes(0),
-                "total_human": _human_bytes(0),
-            })
-
-    return clients
-
-
-def _parse_dnsmasq_leases(text: str) -> dict:
-    """Parse dnsmasq.leases text and return mapping mac -> client dict."""
-    res = {}
-    now = int(time.time())
-    for line in (text or "").splitlines():
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        expiry, mac, ip, hostname = parts[0], parts[1], parts[2], parts[3]
-        hostname = hostname if hostname != "*" else "(unknown)"
-        remaining = int(expiry) - now if expiry.isdigit() else -1
-        if remaining > 0 or int(expiry) == 0:
-            res[mac.lower()] = {
-                "ip": ip,
-                "mac": mac.lower(),
-                "hostname": hostname,
-                "lease_remaining": remaining,
-            }
-    return res
-
-
-def get_ap_clients() -> list:
-    """Attempt to query the Access Point for active stations and usage.
-
-    Supports two configurable methods via `router.conf` / env:
-      - AP_SSH_HOST / AP_SSH_USER [: AP_SSH_KEY, AP_SSH_PORT]
-        Runs: `iw dev <radio> station dump` on the AP via SSH and parses
-        rx/tx bytes per station. Also tries to read dnsmasq leases on the AP
-        to map MAC -> IP/hostname.
-      - AP_API_LEASES_URL
-        Fetches a leases endpoint (JSON or dnsmasq-style text) and parses it.
-
-    Returns a list of client dicts similar to get_active_clients(), with
-    additional keys: `rx_bytes`, `tx_bytes`, `rx_human`, `tx_human`, `total_human`.
-    """
-    host = CONF.get("AP_SSH_HOST")
-    user = CONF.get("AP_SSH_USER")
-    key = CONF.get("AP_SSH_KEY")
-    port = CONF.get("AP_SSH_PORT")
-    leases_url = CONF.get("AP_API_LEASES_URL")
-
-    leases_map = {}
-    stations = {}
-
-    # Method 1: SSH to AP and cat leases + iw station dump
-    if host and user:
-        ssh_base = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
-        if key:
-            ssh_base.extend(["-i", str(key)])
-        if port:
-            ssh_base.extend(["-p", str(port)])
-        dest = f"{user}@{host}"
-
-        # Try to read dnsmasq leases on AP
-        leases_cmd = ssh_base + [dest, "cat /var/lib/misc/dnsmasq.leases || true"]
-        leases_out = _run(leases_cmd, fallback="")
-        leases_map = _parse_dnsmasq_leases(leases_out)
-
-        # Try to get station/usage via iw (common on OpenWrt/hostapd systems)
-        iw_cmd = ssh_base + [dest, "iw dev wlan0 station dump || true"]
-        iw_out = _run(iw_cmd, fallback="")
-        if iw_out:
-            current_mac = None
-            for line in iw_out.splitlines():
-                m = re.search(r"Station\s+([0-9a-f:]{17})", line, re.I)
-                if m:
-                    current_mac = m.group(1).lower()
-                    stations[current_mac] = {"mac": current_mac, "rx_bytes": 0, "tx_bytes": 0}
-                    continue
-                if current_mac:
-                    mrx = re.search(r"rx bytes:\s*(\d+)", line)
-                    mtx = re.search(r"tx bytes:\s*(\d+)", line)
-                    if mrx:
-                        stations[current_mac]["rx_bytes"] = int(mrx.group(1))
-                    if mtx:
-                        stations[current_mac]["tx_bytes"] = int(mtx.group(1))
-
-    # Method 2: API leases URL (JSON or dnsmasq text)
-    if leases_url and not leases_map:
-        try:
-            status, payload = _http_json(leases_url)
-            if status == 200 and isinstance(payload, list):
-                # Expecting list of {mac, ip, hostname}
-                for item in payload:
-                    mac = (item.get("mac") or "").lower()
-                    if not mac: continue
-                    leases_map[mac] = {"ip": item.get("ip"), "mac": mac, "hostname": item.get("hostname", "(unknown)"), "lease_remaining": item.get("lease_remaining", -1)}
-            else:
-                # Try plain text parse
-                if isinstance(payload, dict):
-                    # Not expected; skip
-                    pass
-        except Exception:
-            # Fallback: attempt raw fetch
-            try:
-                out = _run(["curl", "-s", "--max-time", "5", leases_url], fallback="")
-                leases_map = _parse_dnsmasq_leases(out)
-            except Exception:
-                pass
-
-    # Merge leases_map + stations into result list
-    results = []
-    seen = set()
-    for mac, s in {**stations}.items():
-        mac_l = mac.lower()
-        seen.add(mac_l)
-        lease = leases_map.get(mac_l, {})
-        rx = s.get("rx_bytes", 0) or 0
-        tx = s.get("tx_bytes", 0) or 0
-        client = {
-            "mac": mac_l,
-            "ip": lease.get("ip"),
-            "hostname": lease.get("hostname", "(unknown)"),
-            "lease_remaining": lease.get("lease_remaining", -1),
-            "rx_bytes": rx,
-            "tx_bytes": tx,
-            "rx_human": _human_bytes(rx),
-            "tx_human": _human_bytes(tx),
-            "total_human": _human_bytes(rx + tx),
-        }
-        results.append(client)
-
-    # Add any leases that didn't appear in station dump (e.g., sleeping devices)
-    for mac, lease in leases_map.items():
-        if mac in seen:
-            continue
-        results.append({
+        clients.append({
             "mac": mac,
-            "ip": lease.get("ip"),
-            "hostname": lease.get("hostname", "(unknown)"),
-            "lease_remaining": lease.get("lease_remaining", -1),
+            "ip": arp_data["ip"],
+            "hostname": arp_data["hostname"],
+            "lease_remaining": -1,
             "rx_bytes": 0,
             "tx_bytes": 0,
             "rx_human": _human_bytes(0),
@@ -780,7 +543,7 @@ def get_ap_clients() -> list:
             "total_human": _human_bytes(0),
         })
 
-    return results
+    return clients
 
 
 def get_system_stats() -> dict:
