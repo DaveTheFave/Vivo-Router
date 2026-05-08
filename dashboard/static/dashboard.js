@@ -35,6 +35,25 @@ function fmtLease(secs) {
   return m + "m";
 }
 
+function fmtDuration(totalSecs) {
+  const secs = Math.max(0, Math.floor(Number(totalSecs) || 0));
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function fmtTimestamp(isoTs) {
+  if (!isoTs) return "—";
+  const dt = new Date(isoTs);
+  if (Number.isNaN(dt.getTime())) return "—";
+  return dt.toLocaleString();
+}
+
 // ── DOM helpers ───────────────────────────────────────────────────────────────
 function setText(id, val) {
   const el = document.getElementById(id);
@@ -68,6 +87,7 @@ async function fetchStats() {
   renderSystem(data.system || {});
   renderPihole(data.pihole || {});
   renderHealth(data);
+  renderGatewayTimeout(data.gateway_timeout || {});
   renderErrors(data.recent_errors || []);
   setText("last-updated", "Last updated: " + new Date().toLocaleTimeString());
 }
@@ -310,6 +330,46 @@ function renderNetworkHealth(health) {
         : (ap.status === "down" ? "No Connection" : (ap.status || "–"))
     );
   }
+}
+
+function renderGatewayTimeout(monitor) {
+  const stateEl = document.getElementById("gtw-state");
+  const timedOut = Boolean(monitor.is_timed_out);
+
+  if (stateEl) {
+    stateEl.className = "gtw-state " + (timedOut ? "down" : "up");
+    stateEl.textContent = timedOut ? "Timed Out" : "Connected";
+  }
+
+  setText("gtw-current", timedOut ? fmtDuration(monitor.current_timeout_seconds) : "0s");
+  setText("gtw-since", timedOut ? fmtTimestamp(monitor.disconnected_since) : "—");
+  setText("gtw-total", fmtDuration(monitor.total_timeout_seconds));
+  setText("gtw-count", String(monitor.timeout_count || 0));
+
+  const lastDuration = monitor.last_timeout_duration_seconds;
+  const lastEnded = monitor.last_timeout_ended_at;
+  const lastLine = (lastDuration !== null && lastDuration !== undefined)
+    ? `Last timeout: ${fmtDuration(lastDuration)} (ended ${fmtTimestamp(lastEnded)})`
+    : "Last timeout: —";
+  setText("gtw-last", lastLine);
+
+  const logEl = document.getElementById("gtw-log");
+  if (!logEl) return;
+
+  const events = Array.isArray(monitor.recent_timeouts) ? monitor.recent_timeouts : [];
+  if (events.length === 0) {
+    logEl.innerHTML = '<div class="gtw-log-line empty">No gateway timeouts recorded.</div>';
+    return;
+  }
+
+  const lines = events.slice(-8).reverse().map(ev => {
+    const started = fmtTimestamp(ev.started_at);
+    const ended = fmtTimestamp(ev.ended_at);
+    const duration = fmtDuration(ev.duration_seconds);
+    return `<div class="gtw-log-line">${escHtml(started)} → ${escHtml(ended)} · ${escHtml(duration)}</div>`;
+  });
+
+  logEl.innerHTML = lines.join("");
 }
 
 // ── power / battery monitoring ─────────────────────────────────────────────────

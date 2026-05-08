@@ -131,6 +131,36 @@
       </div>
     </div>
 
+    <!-- Gateway timeout monitor -->
+    <div class="panel" id="gateway-timeout-panel">
+      <div class="panel-header">
+        <span class="panel-title">⏱ Gateway Timeout Monitor</span>
+        <span class="gtw-state up" id="gtw-state">Connected</span>
+      </div>
+      <div class="gtw-grid">
+        <div class="gtw-stat">
+          <span class="gtw-label">Current outage</span>
+          <strong class="gtw-value" id="gtw-current">0s</strong>
+        </div>
+        <div class="gtw-stat">
+          <span class="gtw-label">Disconnected since</span>
+          <strong class="gtw-value" id="gtw-since">—</strong>
+        </div>
+        <div class="gtw-stat">
+          <span class="gtw-label">Total timeout</span>
+          <strong class="gtw-value" id="gtw-total">0s</strong>
+        </div>
+        <div class="gtw-stat">
+          <span class="gtw-label">Timeout count</span>
+          <strong class="gtw-value" id="gtw-count">0</strong>
+        </div>
+      </div>
+      <div class="gtw-detail" id="gtw-last">Last timeout: —</div>
+      <div class="gtw-log" id="gtw-log">
+        <div class="gtw-log-line empty">No gateway timeouts recorded.</div>
+      </div>
+    </div>
+
     <!-- Pi-hole panel -->
     <div class="panel" id="pihole-panel">
       <div class="panel-header">

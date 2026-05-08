@@ -8,6 +8,7 @@ import os
 import re
 import json
 import time
+import threading
 import subprocess
 import logging
 import urllib.error
@@ -120,6 +121,82 @@ class BandwidthHistory:
         }
 
 bandwidth_history = BandwidthHistory()
+
+
+class GatewayTimeoutTracker:
+    """Track gateway disconnect windows and cumulative timeout duration."""
+
+    def __init__(self, max_events: int = 30):
+        self._lock = threading.Lock()
+        self._max_events = max_events
+        self._status = "unknown"
+        self._disconnected_since: float | None = None
+        self._timeout_count = 0
+        self._total_timeout_seconds = 0.0
+        self._events: deque[dict] = deque(maxlen=max_events)
+
+    @staticmethod
+    def _is_timed_out(status: str) -> bool:
+        return status in {"down", "error", "unknown"}
+
+    @staticmethod
+    def _iso(ts: float | None) -> str | None:
+        if ts is None:
+            return None
+        return datetime.fromtimestamp(ts, tz=timezone.utc).replace(microsecond=0).isoformat()
+
+    def _snapshot(self, now: float) -> dict:
+        current_outage = 0
+        if self._disconnected_since is not None:
+            current_outage = max(0, round(now - self._disconnected_since))
+
+        last_event = self._events[-1] if self._events else None
+        return {
+            "status": self._status,
+            "is_timed_out": self._disconnected_since is not None,
+            "disconnected_since": self._iso(self._disconnected_since),
+            "current_timeout_seconds": current_outage,
+            "timeout_count": self._timeout_count,
+            "total_timeout_seconds": round(self._total_timeout_seconds),
+            "last_timeout_duration_seconds": (
+                last_event.get("duration_seconds") if last_event else None
+            ),
+            "last_timeout_started_at": (
+                last_event.get("started_at") if last_event else None
+            ),
+            "last_timeout_ended_at": (
+                last_event.get("ended_at") if last_event else None
+            ),
+            "recent_timeouts": list(self._events),
+        }
+
+    def update(self, gateway_health: dict) -> dict:
+        now = time.time()
+        new_status = gateway_health.get("status", "unknown")
+        timed_out = self._is_timed_out(new_status)
+
+        with self._lock:
+            was_timed_out = self._disconnected_since is not None
+
+            if timed_out and not was_timed_out:
+                self._disconnected_since = now
+                self._timeout_count += 1
+            elif not timed_out and was_timed_out:
+                started_at = self._disconnected_since
+                duration = max(0.0, now - started_at)
+                self._total_timeout_seconds += duration
+                self._events.append({
+                    "started_at": self._iso(started_at),
+                    "ended_at": self._iso(now),
+                    "duration_seconds": round(duration),
+                })
+                self._disconnected_since = None
+
+            self._status = new_status
+            return self._snapshot(now)
+
+
+gateway_timeout_tracker = GatewayTimeoutTracker()
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -812,6 +889,7 @@ def api_stats():
     pihole = get_pihole_stats()
     errors = get_recent_errors()
     health = get_health_checks()
+    gateway_timeout = gateway_timeout_tracker.update(health.get("gateway", {}))
 
     wan_iface = CONF["WAN_IFACE"]
     lan_iface = CONF["LAN_IFACE"]
@@ -832,6 +910,7 @@ def api_stats():
         "pihole": pihole,
         "recent_errors": errors,
         "health": health,
+        "gateway_timeout": gateway_timeout,
     })
 
 
