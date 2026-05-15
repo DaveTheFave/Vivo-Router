@@ -552,6 +552,10 @@ def get_hostname(ip: str, timeout: float = 2.0) -> str | None:
     return hostname
 
 
+_hostname_cache: dict = {}  # {ip: (hostname, resolved_timestamp)}
+HOSTNAME_CACHE_TTL = 300  # seconds — re-resolve at most once per 5 minutes
+
+
 def get_hostnames_batch(ips: list, timeout: float = 1.5, max_workers: int = 5) -> dict:
     """Resolve multiple IPs in parallel.
 
@@ -597,9 +601,17 @@ def get_active_clients() -> list:
         return []
 
 
-    # Resolve all hostnames in parallel (Avahi mDNS + reverse DNS fallback)
+    # Resolve hostnames; only look up IPs missing from cache or past TTL
     ips = [client["ip"] for client in arp_clients.values()]
-    hostnames = get_hostnames_batch(ips, timeout=1.5, max_workers=5)
+    now = time.time()
+    stale = [ip for ip in ips
+             if ip not in _hostname_cache
+             or now - _hostname_cache[ip][1] >= HOSTNAME_CACHE_TTL]
+    if stale:
+        fresh = get_hostnames_batch(stale, timeout=1.5, max_workers=5)
+        for ip, hostname in fresh.items():
+            _hostname_cache[ip] = (hostname, now)
+    hostnames = {ip: _hostname_cache.get(ip, (ip, 0))[0] for ip in ips}
 
     # Update clients with resolved hostnames.
     for client in arp_clients.values():
