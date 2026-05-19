@@ -803,6 +803,231 @@ main.grid {
 }
 .power-alert-dismiss:hover { border-color: var(--orange); color: var(--orange); }
 
+/* ── port forwards panel ─────────────────────────────────────────────────── */
+.pf-add-btn {
+  background: none;
+  border: 1px solid var(--green);
+  color: var(--green);
+  padding: 2px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: .75rem;
+  font-weight: 600;
+  transition: background .15s, color .15s;
+  margin-left: auto;
+}
+.pf-add-btn:hover { background: var(--green); color: #000; }
+
+.pf-add-form {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 12px;
+}
+
+.pf-form-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.pf-edit-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 0;
+}
+
+.pf-input {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 4px 8px;
+  font-size: .78rem;
+  font-family: var(--font-mono);
+}
+.pf-input:focus { outline: none; border-color: var(--blue); }
+
+.pf-input-port { width: 80px; }
+.pf-input-ip   { width: 130px; }
+.pf-form-desc  { flex: 1; min-width: 160px; font-family: var(--font); }
+
+.pf-form-active-label {
+  font-size: .78rem;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pf-form-actions { display: flex; gap: 6px; }
+
+.pf-btn-save {
+  background: var(--green);
+  border: none;
+  color: #000;
+  padding: 3px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: .75rem;
+  font-weight: 600;
+}
+.pf-btn-save:hover { opacity: .85; }
+
+.pf-btn-cancel {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 3px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: .75rem;
+}
+.pf-btn-cancel:hover { border-color: var(--text-muted); color: var(--text); }
+
+.pf-section-label {
+  font-size: .7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.pf-section-label-mt { margin-top: 14px; }
+
+.pf-nft-section {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 4px;
+}
+
+.pf-nft-list { display: flex; flex-direction: column; gap: 4px; }
+
+.pf-nft-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: .82rem;
+  padding: 3px 0;
+}
+
+.pf-nft-arrow { color: var(--text-muted); }
+
+.pf-nft-chain {
+  margin-left: auto;
+  font-size: .7rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.pf-nft-empty {
+  font-size: .8rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.pf-table-wrap { overflow-x: auto; }
+
+.pf-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .83rem;
+}
+.pf-table th {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-weight: 500;
+  text-transform: uppercase;
+  font-size: .72rem;
+  letter-spacing: .5px;
+}
+.pf-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--surface2);
+  vertical-align: middle;
+}
+.pf-table tr:last-child td { border-bottom: none; }
+.pf-table tr:not(.pf-edit-row):hover td { background: var(--surface2); }
+
+.pf-dot {
+  display: inline-block;
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+.pf-dot.active   { background: var(--green); animation: pulse 2s infinite; }
+.pf-dot.inactive { background: var(--border); animation: none; }
+
+.pf-sys-badge {
+  font-size: .62rem;
+  background: rgba(57, 197, 207, .12);
+  border: 1px solid rgba(57, 197, 207, .35);
+  color: var(--cyan);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  vertical-align: middle;
+}
+
+.pf-proto-badge {
+  font-size: .7rem;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.pf-proto-tcp    { background: rgba(88, 166, 255, .15);  color: var(--blue);   }
+.pf-proto-udp    { background: rgba(188, 140, 255, .15); color: var(--purple); }
+.pf-proto-tcpudp { background: rgba(63, 185, 80, .15);   color: var(--green);  }
+
+.pf-port {
+  font-family: var(--font-mono);
+  color: var(--yellow);
+  font-weight: 600;
+}
+.pf-internal {
+  font-family: var(--font-mono);
+  color: var(--blue);
+  font-size: .8rem;
+}
+.pf-desc {
+  color: var(--text-muted);
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: .8rem;
+}
+.pf-no-desc { font-style: italic; }
+
+.pf-actions { white-space: nowrap; }
+
+.pf-btn-toggle, .pf-btn-edit, .pf-btn-del {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 5px;
+  border-radius: 3px;
+  font-size: .85rem;
+  transition: color .15s, background .15s;
+}
+.pf-btn-toggle { color: var(--text-muted); }
+.pf-btn-toggle:hover { color: var(--green);  background: rgba(63, 185, 80, .1); }
+.pf-btn-edit   { color: var(--text-muted); }
+.pf-btn-edit:hover   { color: var(--blue);   background: rgba(88, 166, 255, .1); }
+.pf-btn-del    { color: var(--text-muted); }
+.pf-btn-del:hover    { color: var(--red);    background: rgba(248, 81, 73, .1);  }
+
 /* ── status bar / footer ─────────────────────────────────────────────────── */
 footer.statusbar {
   display: flex;

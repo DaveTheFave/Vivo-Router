@@ -294,6 +294,65 @@
       </div>
     </div>
 
+    <!-- Port Forwards panel -->
+    <div class="panel" id="port-forwards-panel">
+      <div class="panel-header">
+        <span class="panel-title">🔌 Port Forwards</span>
+        <span class="count-badge" id="pf-count">0</span>
+        <button class="pf-add-btn" onclick="pfToggleAddForm()">+ Add</button>
+      </div>
+
+      <!-- Add form (hidden by default) -->
+      <div class="pf-add-form" id="pf-add-form" style="display:none">
+        <div class="pf-form-grid">
+          <select class="pf-input" id="pf-form-proto">
+            <option value="tcp">TCP</option>
+            <option value="udp">UDP</option>
+            <option value="tcp/udp">TCP/UDP</option>
+          </select>
+          <input class="pf-input pf-input-port" id="pf-form-ext-port" type="number" min="1" max="65535" placeholder="Ext Port">
+          <input class="pf-input pf-input-ip"   id="pf-form-int-ip"   type="text"   placeholder="Internal IP">
+          <input class="pf-input pf-input-port" id="pf-form-int-port" type="number" min="1" max="65535" placeholder="Int Port">
+          <input class="pf-input pf-form-desc"  id="pf-form-desc"     type="text"   placeholder="Why is this port open?">
+          <label class="pf-form-active-label">
+            <input type="checkbox" id="pf-form-active" checked> Active
+          </label>
+        </div>
+        <div class="pf-form-actions">
+          <button class="pf-btn-save"   onclick="pfAddSubmit()">Add Rule</button>
+          <button class="pf-btn-cancel" onclick="pfToggleAddForm()">Cancel</button>
+        </div>
+      </div>
+
+      <!-- Live nftables rules (read-only) -->
+      <div class="pf-nft-section">
+        <div class="pf-section-label">Live nftables DNAT Rules</div>
+        <div id="pf-nft-list" class="pf-nft-list">
+          <div class="pf-nft-empty">Checking…</div>
+        </div>
+      </div>
+
+      <!-- Manual tracking entries -->
+      <div class="pf-section-label pf-section-label-mt">Tracked Rules</div>
+      <div class="pf-table-wrap">
+        <table class="pf-table">
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Proto</th>
+              <th>Ext Port</th>
+              <th>→ Internal</th>
+              <th>Description</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="pf-tbody">
+            <tr><td colspan="6" class="empty-row">No port forwards configured</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- Recent errors panel -->
     <div class="panel">
       <div class="panel-header">

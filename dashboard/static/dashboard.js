@@ -622,6 +622,186 @@ function drawBandwidthChart(canvas, trends) {
   drawTxLine(lan, colors.lan_tx);
 }
 
+// ── Port Forwards ─────────────────────────────────────────────────────────────
+async function fetchPortForwards() {
+  try {
+    const resp = await fetch("/api/port-forwards", { cache: "no-store" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    renderNftRules(data.nft_rules || []);
+    renderPortForwards(data.entries || []);
+  } catch (err) {
+    console.warn("fetchPortForwards error:", err);
+  }
+}
+
+function renderNftRules(rules) {
+  const el = document.getElementById("pf-nft-list");
+  if (!el) return;
+  if (rules.length === 0) {
+    el.innerHTML = '<div class="pf-nft-empty">No DNAT rules detected in nftables</div>';
+    return;
+  }
+  el.innerHTML = rules.map(r => {
+    const protoKey = (r.protocol || "tcp").replace("/", "");
+    return `
+      <div class="pf-nft-row">
+        <span class="pf-proto-badge pf-proto-${escHtml(protoKey)}">${escHtml((r.protocol || "tcp").toUpperCase())}</span>
+        <span class="pf-port">${escHtml(String(r.external_port))}</span>
+        <span class="pf-nft-arrow">→</span>
+        <span class="pf-internal">${escHtml(r.internal_ip)}:${escHtml(String(r.internal_port))}</span>
+        <span class="pf-nft-chain">${escHtml(r.table)}/${escHtml(r.chain)}</span>
+      </div>`;
+  }).join("");
+}
+
+function renderPortForwards(entries) {
+  setText("pf-count", String(entries.length));
+  const tbody = document.getElementById("pf-tbody");
+  if (!tbody) return;
+
+  if (entries.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-row">No port forwards configured</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = entries.map(pf => {
+    const protoKey = (pf.protocol || "tcp").replace("/", "");
+    const sysBadge = pf.system_detected
+      ? '<span class="pf-sys-badge" title="Detected in iptables">sys</span>'
+      : '';
+    const descHtml = pf.description
+      ? `<span title="${escHtml(pf.description)}">${escHtml(pf.description)}</span>`
+      : '<span class="pf-no-desc">—</span>';
+    return `
+      <tr data-pf-id="${escHtml(pf.id)}">
+        <td><span class="pf-dot ${pf.active ? 'active' : 'inactive'}" title="${pf.active ? 'Active' : 'Inactive'}"></span>${sysBadge}</td>
+        <td><span class="pf-proto-badge pf-proto-${escHtml(protoKey)}">${escHtml((pf.protocol || "tcp").toUpperCase())}</span></td>
+        <td class="pf-port">${escHtml(String(pf.external_port))}</td>
+        <td class="pf-internal">${escHtml(pf.internal_ip)}:${escHtml(String(pf.internal_port))}</td>
+        <td class="pf-desc">${descHtml}</td>
+        <td class="pf-actions">
+          <button class="pf-btn-toggle" onclick="pfToggleActive('${escHtml(pf.id)}',${!pf.active})" title="${pf.active ? 'Mark inactive' : 'Mark active'}">${pf.active ? '●' : '○'}</button>
+          <button class="pf-btn-edit"   onclick="pfStartEdit('${escHtml(pf.id)}')"                  title="Edit">✎</button>
+          <button class="pf-btn-del"    onclick="pfDelete('${escHtml(pf.id)}')"                     title="Delete">✕</button>
+        </td>
+      </tr>`;
+  }).join("");
+}
+
+function pfToggleAddForm() {
+  const form = document.getElementById("pf-add-form");
+  if (!form) return;
+  const showing = form.style.display !== "none";
+  form.style.display = showing ? "none" : "block";
+  if (!showing) document.getElementById("pf-form-ext-port").focus();
+}
+
+async function pfAddSubmit() {
+  const proto   = document.getElementById("pf-form-proto").value;
+  const extPort = document.getElementById("pf-form-ext-port").value;
+  const intIp   = document.getElementById("pf-form-int-ip").value.trim();
+  const intPort = document.getElementById("pf-form-int-port").value;
+  const desc    = document.getElementById("pf-form-desc").value.trim();
+  const active  = document.getElementById("pf-form-active").checked;
+
+  if (!extPort || !intIp || !intPort) {
+    alert("External port, internal IP, and internal port are required.");
+    return;
+  }
+  try {
+    const resp = await fetch("/api/port-forwards", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ protocol: proto, external_port: +extPort, internal_ip: intIp, internal_port: +intPort, description: desc, active }),
+    });
+    if (!resp.ok) { alert("Error: " + ((await resp.json()).error || resp.status)); return; }
+    document.getElementById("pf-form-ext-port").value = "";
+    document.getElementById("pf-form-int-ip").value   = "";
+    document.getElementById("pf-form-int-port").value = "";
+    document.getElementById("pf-form-desc").value     = "";
+    document.getElementById("pf-form-active").checked  = true;
+    document.getElementById("pf-add-form").style.display = "none";
+    fetchPortForwards();
+  } catch (err) { alert("Network error: " + err.message); }
+}
+
+async function pfToggleActive(id, newActive) {
+  try {
+    await fetch("/api/port-forwards/" + id, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ active: newActive }),
+    });
+    fetchPortForwards();
+  } catch (err) { console.warn("pfToggleActive error:", err); }
+}
+
+async function pfDelete(id) {
+  if (!confirm("Delete this port forward rule?")) return;
+  try {
+    await fetch("/api/port-forwards/" + id, { method: "DELETE" });
+    fetchPortForwards();
+  } catch (err) { console.warn("pfDelete error:", err); }
+}
+
+function pfStartEdit(id) {
+  fetch("/api/port-forwards", { cache: "no-store" })
+    .then(r => r.json())
+    .then(entries => {
+      const pf = entries.find(e => e.id === id);
+      if (pf) pfShowEditRow(pf);
+    })
+    .catch(err => console.warn("pfStartEdit error:", err));
+}
+
+function pfShowEditRow(pf) {
+  const tbody = document.getElementById("pf-tbody");
+  if (!tbody) return;
+  const row = tbody.querySelector(`tr[data-pf-id="${CSS.escape(pf.id)}"]`);
+  if (!row) return;
+
+  const selOpts = ["tcp", "udp", "tcp/udp"].map(p =>
+    `<option value="${p}"${pf.protocol === p ? " selected" : ""}>${p.toUpperCase()}</option>`
+  ).join("");
+
+  row.outerHTML = `
+    <tr class="pf-edit-row" data-pf-id="${escHtml(pf.id)}">
+      <td colspan="6">
+        <div class="pf-edit-form">
+          <select class="pf-input" id="pfe-proto-${escHtml(pf.id)}">${selOpts}</select>
+          <input class="pf-input pf-input-port" id="pfe-ext-${escHtml(pf.id)}"  type="number" min="1" max="65535" value="${escHtml(String(pf.external_port))}">
+          <input class="pf-input pf-input-ip"   id="pfe-ip-${escHtml(pf.id)}"   type="text"                       value="${escHtml(pf.internal_ip)}">
+          <input class="pf-input pf-input-port" id="pfe-int-${escHtml(pf.id)}"  type="number" min="1" max="65535" value="${escHtml(String(pf.internal_port))}">
+          <input class="pf-input pf-form-desc"  id="pfe-desc-${escHtml(pf.id)}" type="text"   placeholder="Description" value="${escHtml(pf.description || '')}">
+          <label class="pf-form-active-label">
+            <input type="checkbox" id="pfe-active-${escHtml(pf.id)}"${pf.active ? " checked" : ""}> Active
+          </label>
+          <button class="pf-btn-save"   onclick="pfEditSubmit('${escHtml(pf.id)}')">Save</button>
+          <button class="pf-btn-cancel" onclick="fetchPortForwards()">Cancel</button>
+        </div>
+      </td>
+    </tr>`;
+}
+
+async function pfEditSubmit(id) {
+  const proto   = document.getElementById("pfe-proto-"  + id).value;
+  const extPort = +document.getElementById("pfe-ext-"   + id).value;
+  const intIp   = document.getElementById("pfe-ip-"     + id).value.trim();
+  const intPort = +document.getElementById("pfe-int-"   + id).value;
+  const desc    = document.getElementById("pfe-desc-"   + id).value.trim();
+  const active  = document.getElementById("pfe-active-" + id).checked;
+  try {
+    const resp = await fetch("/api/port-forwards/" + id, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ protocol: proto, external_port: extPort, internal_ip: intIp, internal_port: intPort, description: desc, active }),
+    });
+    if (!resp.ok) { alert("Error: " + ((await resp.json()).error || resp.status)); return; }
+    fetchPortForwards();
+  } catch (err) { alert("Network error: " + err.message); }
+}
+
 // ── XSS safe helper ───────────────────────────────────────────────────────────
 function escHtml(str) {
   return String(str)
@@ -633,7 +813,9 @@ function escHtml(str) {
 }
 
 // ── polling loop ──────────────────────────────────────────────────────────────
-fetchStats(); // first call immediately
-renderTrends(); // fetch trends
+fetchStats();
+renderTrends();
+fetchPortForwards();
 setInterval(fetchStats, REFRESH_MS);
-setInterval(renderTrends, 10000); // fetch trends every 10 seconds
+setInterval(renderTrends, 10000);
+setInterval(fetchPortForwards, 10000);

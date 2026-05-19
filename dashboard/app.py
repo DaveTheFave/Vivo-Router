@@ -9,6 +9,7 @@ import re
 import ssl
 import json
 import time
+import uuid
 import threading
 import subprocess
 import logging
@@ -20,7 +21,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from collections import deque
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 
 # ── configuration ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -81,6 +82,9 @@ def load_conf() -> dict:
     return conf
 
 CONF = load_conf()
+
+PORT_FORWARDS_FILE = BASE_DIR / "port_forwards.json"
+_pf_lock = threading.Lock()
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 logging.basicConfig(level=logging.INFO)
@@ -919,6 +923,114 @@ def _get_pihole_stats_legacy(api_base: str, default: dict) -> dict:
     }
 
 
+def _load_port_forwards() -> list:
+    with _pf_lock:
+        if not PORT_FORWARDS_FILE.exists():
+            return []
+        try:
+            return json.loads(PORT_FORWARDS_FILE.read_text())
+        except Exception:
+            return []
+
+
+def _save_port_forwards(entries: list) -> None:
+    with _pf_lock:
+        PORT_FORWARDS_FILE.write_text(json.dumps(entries, indent=2))
+
+
+def get_nftables_forwards() -> list:
+    """Return list of DNAT port forward rules from nftables.
+
+    Tries JSON output first (nft -j), falls back to text parsing.
+    Each entry: {protocol, external_port, internal_ip, internal_port, table, chain}
+    """
+    rules = _parse_nft_json()
+    if rules is not None:
+        return rules
+    return _parse_nft_text()
+
+
+def _parse_nft_json() -> list | None:
+    """Parse 'nft -j list ruleset'. Returns None if JSON output unavailable."""
+    try:
+        result = subprocess.run(
+            ["nft", "-j", "list", "ruleset"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = json.loads(result.stdout)
+    except Exception:
+        return None
+
+    rules = []
+    for item in data.get("nftables", []):
+        rule = item.get("rule")
+        if not rule:
+            continue
+        # Only DNAT rules in nat/prerouting chains
+        if rule.get("table", "").lower() != "nat":
+            continue
+        if rule.get("chain", "").lower() not in ("prerouting",):
+            continue
+
+        proto = None
+        ext_port = None
+        dnat_addr = None
+        dnat_port = None
+
+        for expr in rule.get("expr", []):
+            if "match" in expr:
+                left = expr["match"].get("left", {})
+                right = expr["match"].get("right")
+                if isinstance(left, dict):
+                    payload = left.get("payload", {})
+                    if payload.get("field") == "dport" and isinstance(right, int):
+                        proto = proto or payload.get("protocol", "tcp")
+                        ext_port = right
+                    meta = left.get("meta", {})
+                    if meta.get("key") == "l4proto" and isinstance(right, str):
+                        proto = proto or right
+            if "dnat" in expr:
+                dnat_addr = expr["dnat"].get("addr")
+                dnat_port = expr["dnat"].get("port")
+
+        if ext_port and dnat_addr:
+            rules.append({
+                "protocol": (proto or "tcp").lower(),
+                "external_port": ext_port,
+                "internal_ip": dnat_addr,
+                "internal_port": dnat_port or ext_port,
+                "table": rule.get("table", "nat"),
+                "chain": rule.get("chain", "prerouting"),
+            })
+    return rules
+
+
+def _parse_nft_text() -> list:
+    """Parse 'nft list ruleset' text output as fallback."""
+    rules = []
+    try:
+        out = _run(["nft", "list", "ruleset"])
+        for line in out.splitlines():
+            m = re.search(
+                r"(tcp|udp)?\s*dport\s+(\d+)\s+dnat\s+to\s+(\d+\.\d+\.\d+\.\d+):(\d+)",
+                line, re.IGNORECASE
+            )
+            if m:
+                rules.append({
+                    "protocol": (m.group(1) or "tcp").lower(),
+                    "external_port": int(m.group(2)),
+                    "internal_ip": m.group(3),
+                    "internal_port": int(m.group(4)),
+                    "table": "nat",
+                    "chain": "prerouting",
+                })
+    except Exception:
+        pass
+    return rules
+
+
 def get_recent_errors(n: int = 20) -> list:
     """
     Return the last n error/warning lines from dnsmasq and syslog.
@@ -1020,6 +1132,106 @@ def api_trends():
 def api_health():
     """Return gateway and DNS health checks."""
     return jsonify(get_health_checks())
+
+
+@app.route("/api/port-forwards", methods=["GET"])
+def api_port_forwards_get():
+    entries = _load_port_forwards()
+    nft_rules = get_nftables_forwards()
+    nft_ports = {(r["protocol"], r["external_port"]) for r in nft_rules}
+
+    for entry in entries:
+        proto = entry.get("protocol", "tcp").lower()
+        ext = int(entry.get("external_port", 0))
+        if proto == "tcp/udp":
+            entry["system_detected"] = ("tcp", ext) in nft_ports or ("udp", ext) in nft_ports
+        else:
+            entry["system_detected"] = (proto, ext) in nft_ports
+
+    return jsonify({"entries": entries, "nft_rules": nft_rules})
+
+
+@app.route("/api/port-forwards", methods=["POST"])
+def api_port_forwards_create():
+    data = request.get_json(force=True) or {}
+    try:
+        ext_port = int(data.get("external_port", 0))
+        int_port = int(data.get("internal_port", 0))
+        if not (1 <= ext_port <= 65535) or not (1 <= int_port <= 65535):
+            return jsonify({"error": "Port must be 1–65535"}), 400
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid port number"}), 400
+
+    internal_ip = str(data.get("internal_ip", "")).strip()
+    if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", internal_ip):
+        return jsonify({"error": "Invalid internal IP address"}), 400
+
+    protocol = str(data.get("protocol", "tcp")).strip().lower()
+    if protocol not in ("tcp", "udp", "tcp/udp"):
+        return jsonify({"error": "Protocol must be tcp, udp, or tcp/udp"}), 400
+
+    entry = {
+        "id": uuid.uuid4().hex[:8],
+        "protocol": protocol,
+        "external_port": ext_port,
+        "internal_ip": internal_ip,
+        "internal_port": int_port,
+        "description": str(data.get("description", "")).strip()[:200],
+        "active": bool(data.get("active", True)),
+        "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    }
+    entries = _load_port_forwards()
+    entries.append(entry)
+    _save_port_forwards(entries)
+    return jsonify(entry), 201
+
+
+@app.route("/api/port-forwards/<entry_id>", methods=["PUT"])
+def api_port_forwards_update(entry_id: str):
+    data = request.get_json(force=True) or {}
+    entries = _load_port_forwards()
+    for i, e in enumerate(entries):
+        if e.get("id") != entry_id:
+            continue
+        if "description" in data:
+            entries[i]["description"] = str(data["description"]).strip()[:200]
+        if "active" in data:
+            entries[i]["active"] = bool(data["active"])
+        if "protocol" in data:
+            proto = str(data["protocol"]).strip().lower()
+            if proto in ("tcp", "udp", "tcp/udp"):
+                entries[i]["protocol"] = proto
+        if "external_port" in data:
+            try:
+                p = int(data["external_port"])
+                if 1 <= p <= 65535:
+                    entries[i]["external_port"] = p
+            except (ValueError, TypeError):
+                pass
+        if "internal_port" in data:
+            try:
+                p = int(data["internal_port"])
+                if 1 <= p <= 65535:
+                    entries[i]["internal_port"] = p
+            except (ValueError, TypeError):
+                pass
+        if "internal_ip" in data:
+            ip = str(data["internal_ip"]).strip()
+            if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
+                entries[i]["internal_ip"] = ip
+        _save_port_forwards(entries)
+        return jsonify(entries[i])
+    return jsonify({"error": "Not found"}), 404
+
+
+@app.route("/api/port-forwards/<entry_id>", methods=["DELETE"])
+def api_port_forwards_delete(entry_id: str):
+    entries = _load_port_forwards()
+    new_entries = [e for e in entries if e.get("id") != entry_id]
+    if len(new_entries) == len(entries):
+        return jsonify({"error": "Not found"}), 404
+    _save_port_forwards(new_entries)
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
