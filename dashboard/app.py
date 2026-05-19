@@ -6,6 +6,7 @@ Provides real-time router statistics via a REST API consumed by the frontend.
 
 import os
 import re
+import ssl
 import json
 import time
 import threading
@@ -750,7 +751,8 @@ def get_pihole_stats() -> dict:
 
 
 def _http_json(url: str, *, timeout: int = 3, method: str = "GET",
-               headers: dict | None = None, body: dict | None = None) -> tuple[int, dict]:
+               headers: dict | None = None, body: dict | None = None,
+               verify_ssl: bool = True) -> tuple[int, dict]:
     req_headers = {"Accept": "application/json"}
     if headers:
         req_headers.update(headers)
@@ -761,8 +763,15 @@ def _http_json(url: str, *, timeout: int = 3, method: str = "GET",
         req_headers["Content-Type"] = "application/json"
 
     req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+
+    ctx = None
+    if not verify_ssl:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             payload = json.loads(resp.read().decode("utf-8") or "{}")
             return resp.status, payload
     except urllib.error.HTTPError as err:
@@ -771,6 +780,11 @@ def _http_json(url: str, *, timeout: int = 3, method: str = "GET",
         except Exception:
             payload = {}
         return err.code, payload
+
+
+_pihole_sid: dict = {"sid": None, "expires": 0.0}
+_pihole_cache: dict = {"data": None, "expires": 0.0}
+PIHOLE_CACHE_TTL = 30  # seconds — avoid hammering Pi-hole on every 5 s poll
 
 
 def _resolve_pihole_password() -> str:
@@ -787,48 +801,88 @@ def _resolve_pihole_password() -> str:
     return ""
 
 
+def _pihole_authenticate(api_base: str) -> str | None:
+    """Return a valid session SID, reusing the cached value while it lives."""
+    now = time.time()
+    if _pihole_sid["sid"] and now < _pihole_sid["expires"]:
+        return _pihole_sid["sid"]
+
+    password = _resolve_pihole_password()
+    if not password:
+        return None
+
+    sc, login = _http_json(
+        f"{api_base}/auth",
+        method="POST",
+        body={"password": password},
+        verify_ssl=False,
+    )
+    if sc != 200:
+        return None
+
+    session = login.get("session") or {}
+    sid = session.get("sid")
+    validity = float(session.get("validity") or 270)
+    if sid:
+        _pihole_sid["sid"] = sid
+        _pihole_sid["expires"] = now + validity - 30
+    return sid
+
+
 def _get_pihole_stats_v6(api_base: str, default: dict) -> dict:
-    status_code, auth_info = _http_json(f"{api_base.rstrip('/')}/auth")
+    now = time.time()
+    if _pihole_cache["data"] and now < _pihole_cache["expires"]:
+        return _pihole_cache["data"]
+
+    base = api_base.rstrip("/")
+
+    # Check for anonymous access (Pi-hole with no password returns valid=true, sid=null)
+    sc, auth_info = _http_json(f"{base}/auth", verify_ssl=False)
     session = auth_info.get("session") or {}
     sid = session.get("sid")
 
-    if status_code == 401 or not session.get("valid", False):
-        password = _resolve_pihole_password()
-        if not password:
-            return {
-                **default,
-                "status": "auth_required",
-                "error": "Pi-hole API password required",
-            }
-        status_code, login = _http_json(
-            f"{api_base.rstrip('/')}/auth",
-            method="POST",
-            body={"password": password},
-        )
-        if status_code != 200:
-            return {
-                **default,
-                "status": "auth_failed",
-                "error": "Pi-hole API authentication failed",
-            }
-        sid = (login.get("session") or {}).get("sid")
+    if sc == 401 or not session.get("valid", False):
+        sid = _pihole_authenticate(base)
+        if sid is None:
+            return {**default, "status": "auth_required",
+                    "error": "Pi-hole API password required"}
 
-    headers = {}
-    if sid:
-        headers["sid"] = sid
+    headers = {"sid": sid} if sid else {}
 
-    status_code, summary = _http_json(
-        f"{api_base.rstrip('/')}/stats/summary",
-        headers=headers,
-    )
-    if status_code != 200:
-        raise RuntimeError(f"Pi-hole v6 summary request failed ({status_code})")
+    sc, summary = _http_json(f"{base}/stats/summary", headers=headers, verify_ssl=False)
+    if sc == 401:
+        # Cached SID expired; force re-auth once
+        _pihole_sid.update({"sid": None, "expires": 0.0})
+        sid = _pihole_authenticate(base)
+        headers = {"sid": sid} if sid else {}
+        sc, summary = _http_json(f"{base}/stats/summary", headers=headers, verify_ssl=False)
+    if sc != 200:
+        raise RuntimeError(f"Pi-hole v6 summary failed ({sc})")
 
     queries = summary.get("queries") or {}
     clients = summary.get("clients") or {}
     gravity = summary.get("gravity") or {}
 
-    return {
+    _, top_blocked_resp = _http_json(
+        f"{base}/stats/top_domains?count=5&blocked=true",
+        headers=headers, verify_ssl=False,
+    )
+    _, top_queried_resp = _http_json(
+        f"{base}/stats/top_domains?count=5",
+        headers=headers, verify_ssl=False,
+    )
+    _, qt_resp = _http_json(
+        f"{base}/stats/query_types",
+        headers=headers, verify_ssl=False,
+    )
+
+    def _parse_domains(resp: dict) -> list:
+        return [
+            {"domain": d.get("domain", "?"), "count": d.get("count", 0)}
+            for d in (resp.get("domains") or [])
+        ]
+
+    result = {
         "enabled": True,
         "status": "enabled",
         "domains_blocked": gravity.get("domains_being_blocked", 0),
@@ -836,7 +890,13 @@ def _get_pihole_stats_v6(api_base: str, default: dict) -> dict:
         "ads_blocked_today": queries.get("blocked", 0),
         "ads_percentage_today": round(float(queries.get("percent_blocked", 0) or 0), 1),
         "unique_clients": clients.get("active", 0),
+        "top_blocked": _parse_domains(top_blocked_resp),
+        "top_queried": _parse_domains(top_queried_resp),
+        "query_types": {k: v for k, v in (qt_resp.get("types") or {}).items() if v > 0},
     }
+
+    _pihole_cache.update({"data": result, "expires": now + PIHOLE_CACHE_TTL})
+    return result
 
 
 def _get_pihole_stats_legacy(api_base: str, default: dict) -> dict:

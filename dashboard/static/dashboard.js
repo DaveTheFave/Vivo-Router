@@ -198,6 +198,46 @@ function renderPihole(ph) {
   setText("ph-queries",       fmtNum(ph.queries_today));
   setText("ph-domains",       fmtNum(ph.domains_blocked));
   setText("ph-clients",       fmtNum(ph.unique_clients));
+
+  renderPhDomainList("ph-top-blocked", ph.top_blocked || []);
+  renderPhDomainList("ph-top-queried", ph.top_queried || []);
+  renderPhQueryTypes("ph-query-types", ph.query_types || {});
+}
+
+function renderPhDomainList(id, domains) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (domains.length === 0) {
+    el.innerHTML = '<div class="ph-row ph-empty">No data</div>';
+    return;
+  }
+  const max = domains[0].count || 1;
+  el.innerHTML = domains.map(d => `
+    <div class="ph-row">
+      <span class="ph-row-label">${escHtml(d.domain)}</span>
+      <div class="ph-bar-wrap"><div class="ph-bar" style="width:${Math.round(d.count / max * 100)}%"></div></div>
+      <span class="ph-row-count">${fmtNum(d.count)}</span>
+    </div>`).join("");
+}
+
+function renderPhQueryTypes(id, types) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const entries = Object.entries(types).sort((a, b) => b[1] - a[1]);
+  if (entries.length === 0) {
+    el.innerHTML = '<div class="ph-row ph-empty">No data</div>';
+    return;
+  }
+  const total = entries.reduce((s, [, v]) => s + v, 0) || 1;
+  el.innerHTML = entries.map(([type, count]) => {
+    const pct = Math.round(count / total * 100);
+    return `
+    <div class="ph-row">
+      <span class="ph-row-label ph-qt-type">${escHtml(type)}</span>
+      <div class="ph-bar-wrap"><div class="ph-bar ph-bar-qt" style="width:${pct}%"></div></div>
+      <span class="ph-row-count">${pct}%</span>
+    </div>`;
+  }).join("");
 }
 
 // ── error log ─────────────────────────────────────────────────────────────────
