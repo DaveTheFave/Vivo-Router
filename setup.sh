@@ -95,6 +95,13 @@ prompt LAN_IFACE  "LAN interface (connected to TP-Link AP)" "$(list_interfaces |
 
 [[ "$WAN_IFACE" == "$LAN_IFACE" ]] && die "WAN and LAN interfaces must be different."
 
+VLAN_ENABLED=false
+WAN_VLAN_ID=""
+if prompt_yn "Does your WAN connection require VLAN tags?" "n"; then
+    VLAN_ENABLED=true
+    prompt WAN_VLAN_ID "WAN VLAN ID" "100"
+fi
+
 prompt LAN_IP     "LAN gateway IP for this machine"          "192.168.1.1"
 prompt LAN_SUBNET "LAN subnet (CIDR)"                        "192.168.1.0/24"
 prompt DHCP_START "DHCP range start"                         "192.168.1.100"
@@ -126,6 +133,7 @@ echo -e "${BOLD}Configuration Summary${NC}"
 hr
 echo ""
 echo -e "  WAN interface : ${GREEN}${WAN_IFACE}${NC}"
+[[ "$VLAN_ENABLED" == "true" ]] && echo -e "  WAN VLAN tag  : ${GREEN}${WAN_VLAN_ID}${NC}"
 echo -e "  LAN interface : ${GREEN}${LAN_IFACE}${NC}"
 echo -e "  LAN gateway   : ${GREEN}${LAN_IP}${NC}"
 echo -e "  LAN subnet    : ${GREEN}${LAN_SUBNET}${NC}"
@@ -185,6 +193,15 @@ info "Writing netplan config to ${NETPLAN_FILE}…"
 # Derive prefix length from the CIDR notation
 PREFIX="${LAN_SUBNET##*/}"
 
+# Determine the actual WAN interface to use for firewall/DNS rules
+if [[ "$VLAN_ENABLED" == "true" ]]; then
+    WAN_VLAN_IFACE="${WAN_IFACE}.${WAN_VLAN_ID}"
+    ACTUAL_WAN_IFACE="${WAN_VLAN_IFACE}"
+else
+    ACTUAL_WAN_IFACE="${WAN_IFACE}"
+fi
+
+# Build netplan config for LAN and optionally VLAN on WAN
 cat > "$NETPLAN_FILE" <<EOF
 network:
   version: 2
@@ -194,7 +211,20 @@ network:
       dhcp4: no
       addresses:
         - ${LAN_IP}/${PREFIX}
+    ${WAN_IFACE}:
+      dhcp4: $([ "$VLAN_ENABLED" == "true" ] && echo "no" || echo "yes")
 EOF
+
+# Add VLAN configuration if enabled
+if [[ "$VLAN_ENABLED" == "true" ]]; then
+    cat >> "$NETPLAN_FILE" <<EOF
+  vlans:
+    ${WAN_VLAN_IFACE}:
+      id: ${WAN_VLAN_ID}
+      link: ${WAN_IFACE}
+      dhcp4: yes
+EOF
+fi
 
 info "Applying netplan…"
 netplan apply 2>/dev/null || warn "netplan apply returned non-zero; interface may need a manual restart."
@@ -217,18 +247,24 @@ sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
 info "Configuring nftables firewall and NAT…"
 
 NFT_CONF="/etc/nftables.conf"
+NFT_INCLUDE_DIR="/etc/nftables.d"
+
+mkdir -p "$NFT_INCLUDE_DIR"
 
 cat > "$NFT_CONF" <<EOF
 #!/usr/sbin/nft -f
 
 flush ruleset
 
+# Include custom port forwarding rules (managed by manage-portfwd.sh)
+include "${NFT_INCLUDE_DIR}/*.conf"
+
 table inet filter {
 
     # ── Flowtable: bypasses netfilter for established flows ──────────────────
     flowtable ft {
         hook ingress priority 0;
-        devices = { ${LAN_IFACE}, ${WAN_IFACE} };
+        devices = { ${LAN_IFACE}, ${ACTUAL_WAN_IFACE} };
     }
 
     chain input {
@@ -269,7 +305,7 @@ table inet filter {
         ct state invalid drop
 
         # LAN -> WAN
-        iifname "${LAN_IFACE}" oifname "${WAN_IFACE}" accept
+        iifname "${LAN_IFACE}" oifname "${ACTUAL_WAN_IFACE}" accept
 
         # LAN -> LAN (future segments)
         iifname "${LAN_IFACE}" oifname "${LAN_IFACE}" accept
@@ -294,9 +330,9 @@ table ip nat {
         type nat hook prerouting priority -100;
 
         # Port forwards from WAN
-        iifname "${WAN_IFACE}" tcp dport 2323 dnat to 192.168.1.54
-        iifname "${WAN_IFACE}" tcp dport 8920 dnat to 192.168.1.54
-        iifname "${WAN_IFACE}" tcp dport 2222 dnat to 192.168.1.88
+        iifname "${ACTUAL_WAN_IFACE}" tcp dport 2323 dnat to 192.168.1.54
+        iifname "${ACTUAL_WAN_IFACE}" tcp dport 8920 dnat to 192.168.1.54
+        iifname "${ACTUAL_WAN_IFACE}" tcp dport 2222 dnat to 192.168.1.88
     }
 
     chain postrouting {
@@ -304,7 +340,7 @@ table ip nat {
         policy accept;
 
         # IPv4 masquerade LAN -> WAN
-        oifname "${WAN_IFACE}" ip saddr ${LAN_SUBNET} masquerade
+        oifname "${ACTUAL_WAN_IFACE}" ip saddr ${LAN_SUBNET} masquerade
     }
 }
 EOF
@@ -409,8 +445,8 @@ echo -e "${BOLD}STEP 8 — vnstat Bandwidth Monitoring${NC}"
 hr
 echo ""
 
-info "Configuring vnstat for WAN interface (${WAN_IFACE})…"
-vnstat --add -i "$WAN_IFACE" 2>/dev/null || true
+info "Configuring vnstat for WAN interface (${ACTUAL_WAN_IFACE})…"
+vnstat --add -i "$ACTUAL_WAN_IFACE" 2>/dev/null || true
 vnstat --add -i "$LAN_IFACE" 2>/dev/null || true
 systemctl enable vnstat >/dev/null 2>&1 || true
 systemctl restart vnstat || warn "vnstat failed to start."
@@ -434,11 +470,14 @@ python3 -m venv "${DASH_DIR}/.venv"
 
 # Write runtime config read by dashboard/app.py
 cat > "${DASH_DIR}/router.conf" <<EOF
-WAN_IFACE=${WAN_IFACE}
+WAN_IFACE=${ACTUAL_WAN_IFACE}
+WAN_PHYSICAL_IFACE=${WAN_IFACE}
 LAN_IFACE=${LAN_IFACE}
 LAN_IP=${LAN_IP}
 PIHOLE_ENABLED=${INSTALL_PIHOLE}
 PIHOLE_API=http://localhost/admin/api
+VLAN_ENABLED=${VLAN_ENABLED}
+VLAN_ID=${WAN_VLAN_ID}
 EOF
 
 info "Installing systemd service for dashboard…"
@@ -524,6 +563,8 @@ echo -e "  Useful commands:"
 echo -e "    systemctl status vivo-router-dashboard"
 echo -e "    journalctl -fu vivo-router-dashboard"
 echo -e "    journalctl -fu dnsmasq"
+echo -e "    sudo bash manage-portfwd.sh list     # Show port forwards"
+echo -e "    sudo bash manage-portfwd.sh add      # Add a port forward"
 echo ""
 echo -e "  ${YELLOW}NOTE:${NC} Reboot the server to activate all changes cleanly."
 echo ""
