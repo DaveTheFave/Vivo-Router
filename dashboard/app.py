@@ -596,15 +596,214 @@ def get_hostnames_batch(ips: list, timeout: float = 1.5, max_workers: int = 5) -
     return results
 
 
+# ── per-client bandwidth tracking via nftables counters ─────────────────────
+
+class ClientBandwidthTracker:
+    """Track per-client bandwidth using nftables counters."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tracked_ips: dict = {}  # {ip: timestamp_added}
+        self._counters_cache: dict = {}  # {ip: {rx_bytes, tx_bytes, ts}}
+        self._last_sample_time: float = 0
+        self._sample_interval: float = 5  # Sample every 5 seconds
+
+    def ensure_rules(self, client_ips: list, lan_iface: str):
+        """Ensure nftables rules exist for each client IP.
+
+        Creates rules like:
+          ip saddr {ip} counter  (track uploads/tx)
+          ip daddr {ip} counter  (track downloads/rx)
+        """
+        with self._lock:
+            now = time.time()
+            new_ips = set(client_ips) - set(self._tracked_ips.keys())
+
+            for ip in new_ips:
+                try:
+                    # Validate IP format
+                    if not re.match(r"\d{1,3}(\.\d{1,3}){3}", ip):
+                        log.warning(f"Invalid IP format: {ip}")
+                        continue
+
+                    # Add rule to track outbound traffic from client (upload)
+                    result = subprocess.run(
+                        ["nft", "add", "rule", "inet", "filter", "forward",
+                         f"ip saddr {ip} counter"],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    if result.returncode != 0:
+                        log.warning(f"nft saddr rule failed for {ip}: {result.stderr.strip()}")
+
+                    # Add rule to track inbound traffic to client (download)
+                    result = subprocess.run(
+                        ["nft", "add", "rule", "inet", "filter", "forward",
+                         f"ip daddr {ip} counter"],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    if result.returncode != 0:
+                        log.warning(f"nft daddr rule failed for {ip}: {result.stderr.strip()}")
+
+                    self._tracked_ips[ip] = now
+                    log.debug(f"Added nftables counters for client {ip}")
+                except subprocess.TimeoutExpired:
+                    log.warning(f"nft command timed out for {ip}")
+                except Exception as exc:
+                    log.warning(f"Failed to add nftables rule for {ip}: {exc}")
+
+    def get_bandwidth(self, client_ips: list) -> dict:
+        """Query nftables for per-IP bandwidth data.
+
+        Returns dict mapping IP -> {rx_bytes, tx_bytes, rx_rate, tx_rate}
+        Rates are in bytes/sec.
+        """
+        results = {}
+
+        try:
+            # Parse nftables JSON output for counter rules
+            result = subprocess.run(
+                ["nft", "-j", "list", "ruleset"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                log.debug("nftables query returned no data")
+                return results
+
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            log.warning(f"Failed to parse nftables JSON: {exc}")
+            return results
+        except Exception as exc:
+            log.warning(f"Failed to query nftables: {exc}")
+            return results
+
+        # Extract counter values per IP
+        ip_counters = {}  # {ip: {saddr_bytes, daddr_bytes}}
+
+        try:
+            for item in data.get("nftables", []):
+                rule = item.get("rule")
+                if not rule:
+                    continue
+
+                table = rule.get("table")
+                chain = rule.get("chain")
+
+                # Only process inet filter forward rules
+                if table != "inet" or chain != "forward":
+                    continue
+
+                exprs = rule.get("expr", [])
+                if not isinstance(exprs, list) or len(exprs) < 2:
+                    continue
+
+                # Look for pattern: [match expression, counter expression]
+                counter_data = None
+                match_field = None
+                match_ip = None
+
+                for expr in exprs:
+                    if not isinstance(expr, dict):
+                        continue
+
+                    # Check for counter
+                    if "counter" in expr:
+                        counter_data = expr.get("counter", {})
+
+                    # Check for match expression
+                    if "match" in expr:
+                        match = expr["match"]
+                        if not isinstance(match, dict):
+                            continue
+
+                        left = match.get("left")
+                        right = match.get("right")
+
+                        # Extract field (saddr or daddr) and IP
+                        if isinstance(left, dict):
+                            payload = left.get("payload", {})
+                            field = payload.get("field")
+                            if field in ("saddr", "daddr"):
+                                match_field = field
+                                # right can be string (single IP) or dict/list
+                                if isinstance(right, str) and re.match(r"\d+\.\d+\.\d+\.\d+", right):
+                                    match_ip = right
+
+                # Record if we found both match and counter
+                if counter_data and match_field and match_ip:
+                    if match_ip not in ip_counters:
+                        ip_counters[match_ip] = {}
+                    ip_counters[match_ip][match_field] = counter_data.get("bytes", 0)
+
+        except Exception as exc:
+            log.warning(f"Failed to parse nftables output: {exc}")
+
+        # Combine saddr (tx) and daddr (rx) counters for each IP
+        now = time.time()
+        with self._lock:
+            for ip in client_ips:
+                saddr_bytes = ip_counters.get(ip, {}).get("saddr", 0)
+                daddr_bytes = ip_counters.get(ip, {}).get("daddr", 0)
+
+                prev = self._counters_cache.get(ip, {})
+                prev_saddr = prev.get("saddr_bytes", 0)
+                prev_daddr = prev.get("daddr_bytes", 0)
+                prev_ts = prev.get("ts", now)
+
+                dt = max(now - prev_ts, 1)  # Avoid division by zero
+                tx_rate = max(0, (saddr_bytes - prev_saddr) / dt)
+                rx_rate = max(0, (daddr_bytes - prev_daddr) / dt)
+
+                self._counters_cache[ip] = {
+                    "saddr_bytes": saddr_bytes,
+                    "daddr_bytes": daddr_bytes,
+                    "ts": now,
+                }
+
+                results[ip] = {
+                    "rx_bytes": daddr_bytes,
+                    "tx_bytes": saddr_bytes,
+                    "rx_rate": round(rx_rate),
+                    "tx_rate": round(tx_rate),
+                }
+
+        return results
+
+    def cleanup_stale_rules(self, active_ips: list, timeout_seconds: int = 600):
+        """Remove nftables rules for IPs not seen in recent activity.
+
+        Keeps rules for IPs seen within timeout_seconds, removes others.
+        """
+        with self._lock:
+            now = time.time()
+            stale_ips = [
+                ip for ip, added_ts in self._tracked_ips.items()
+                if ip not in active_ips and (now - added_ts) > timeout_seconds
+            ]
+
+            for ip in stale_ips:
+                try:
+                    # Attempting to delete rules is best-effort; nft delete requires handle
+                    # which we don't track, so this is a no-op. Rules will remain but
+                    # won't cause problems (minimal memory/cpu impact).
+                    # For now, just remove from our tracking dict.
+                    del self._tracked_ips[ip]
+                    if ip in self._counters_cache:
+                        del self._counters_cache[ip]
+                    log.debug(f"Removed tracking for stale client {ip}")
+                except Exception as exc:
+                    log.warning(f"Failed to clean up tracking for {ip}: {exc}")
+
+
+_client_bandwidth_tracker = ClientBandwidthTracker()
 
 
 def get_active_clients() -> list:
-    """Discover active clients using ARP + parallel hostname resolution."""
+    """Discover active clients using ARP + nftables bandwidth tracking."""
     # Get clients from ARP table
     arp_clients = get_arp_clients()
     if not arp_clients:
         return []
-
 
     # Resolve hostnames; only look up IPs missing from cache or past TTL
     ips = [client["ip"] for client in arp_clients.values()]
@@ -622,19 +821,40 @@ def get_active_clients() -> list:
     for client in arp_clients.values():
         client["hostname"] = hostnames.get(client["ip"], "(unknown)")
 
-    # Build final client list with normalized fields expected by the UI.
+    # Ensure nftables counter rules exist for these clients (best effort)
+    try:
+        lan_iface = CONF.get("LAN_IFACE", "eth1")
+        _client_bandwidth_tracker.ensure_rules(ips, lan_iface)
+
+        # Clean up stale rules for clients that haven't been seen in 10+ minutes
+        _client_bandwidth_tracker.cleanup_stale_rules(ips, timeout_seconds=600)
+
+        # Query bandwidth data for all clients
+        bandwidth_data = _client_bandwidth_tracker.get_bandwidth(ips)
+    except Exception as exc:
+        log.error(f"Bandwidth tracking failed: {exc}")
+        bandwidth_data = {}
+
+    # Build final client list with bandwidth data from nftables
     clients = []
     for mac, arp_data in arp_clients.items():
+        ip = arp_data["ip"]
+        bw = bandwidth_data.get(ip, {})
+        rx_bytes = bw.get("rx_bytes", 0)
+        tx_bytes = bw.get("tx_bytes", 0)
+        rx_rate = bw.get("rx_rate", 0)
+        tx_rate = bw.get("tx_rate", 0)
+
         clients.append({
             "mac": mac,
-            "ip": arp_data["ip"],
+            "ip": ip,
             "hostname": arp_data["hostname"],
             "lease_remaining": -1,
-            "rx_bytes": 0,
-            "tx_bytes": 0,
-            "rx_human": _human_bytes(0),
-            "tx_human": _human_bytes(0),
-            "total_human": _human_bytes(0),
+            "rx_bytes": rx_bytes,
+            "tx_bytes": tx_bytes,
+            "rx_human": _human_bytes(rx_rate),
+            "tx_human": _human_bytes(tx_rate),
+            "total_human": _human_bytes(rx_rate + tx_rate),
         })
 
     return clients

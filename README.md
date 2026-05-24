@@ -9,7 +9,9 @@ Turn an Ubuntu server (e.g., a laptop) into a fully-featured router / gateway, c
 | Feature | Details |
 |---|---|
 | **Interactive setup wizard** | `setup.sh` walks you through every configuration step |
-| **NAT / IP Forwarding** | iptables masquerade rules with persistence across reboots |
+| **VLAN support** | Optional VLAN tagging for WAN connections (e.g., ISP VLAN requirements) |
+| **NAT / IP Forwarding** | nftables firewall with persistent rules across reboots |
+| **Port forwarding** | Easy-to-use `manage-portfwd.sh` script for adding/removing rules |
 | **DHCP + DNS** | dnsmasq configured for your LAN subnet |
 | **Pi-hole integration** | Optional DNS-level ad blocking, wired automatically to dnsmasq |
 | **GUI Dashboard** | Dark-themed web dashboard served by Flask on port 5000 |
@@ -65,6 +67,8 @@ The wizard will ask you for:
 | Prompt | Example |
 |---|---|
 | WAN interface | `enp2s0` (connected to modem) |
+| WAN VLAN required? | `y` / `n` — ask if ISP requires VLAN tagging |
+| WAN VLAN ID | `100` — only if VLAN enabled |
 | LAN interface | `enp3s0` or `eth1` (connected to AP) |
 | LAN gateway IP | `192.168.1.1` |
 | LAN subnet | `192.168.1.0/24` |
@@ -154,6 +158,7 @@ sudo journalctl -fu    dnsmasq
 ```
 Vivo-Router/
 ├── setup.sh                         # Interactive router setup wizard
+├── manage-portfwd.sh                # Port forwarding manager (add/remove/list rules)
 ├── dashboard/
 │   ├── app.py                       # Flask backend / REST API
 │   ├── requirements.txt             # Python dependencies (flask, psutil)
@@ -167,6 +172,50 @@ Vivo-Router/
     ├── vivo-router-dashboard.service  # systemd unit — Flask app
     └── vivo-router-kiosk.service      # systemd unit — Chromium kiosk
 ```
+
+---
+
+## Port Forwarding Management
+
+Use **`manage-portfwd.sh`** to quickly add or remove port forwarding rules without manually editing nftables:
+
+### Add a port forward
+
+```bash
+sudo bash manage-portfwd.sh add
+```
+
+Prompts you for:
+- **External port** (WAN side) — e.g., `8080`
+- **Internal IP** (LAN host) — e.g., `192.168.1.54`
+- **Internal port** (LAN side) — defaults to external port
+- **Protocol** — `tcp`, `udp`, or `both`
+
+Example: Forward external port `8080` to internal host `192.168.1.54:8080`
+
+### List all port forwards
+
+```bash
+sudo bash manage-portfwd.sh list
+```
+
+Shows active DNAT and forward rules.
+
+### Remove a port forward
+
+```bash
+sudo bash manage-portfwd.sh remove
+```
+
+Prompts for the rule details and removes it.
+
+### Reload rules (after reboot)
+
+```bash
+sudo bash manage-portfwd.sh reload
+```
+
+Restores all saved port forwarding rules from `/etc/nftables.d/10-portfwd.conf`.
 
 ---
 
