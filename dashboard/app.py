@@ -1379,7 +1379,7 @@ def _parse_nft_text() -> list:
     return rules
 
 
-def get_psad_blocked_ips() -> list:
+def get_psad_auto_blocked_ips() -> list:
     """Query nftables for IPs currently auto-blocked by psad.
 
     psad's iptables-nft compat layer manages a separate 'ip filter' table
@@ -1397,7 +1397,7 @@ def get_psad_blocked_ips() -> list:
             return []
         data = json.loads(result.stdout)
     except Exception as exc:
-        log.debug(f"get_psad_blocked_ips: nft query failed: {exc}")
+        log.debug(f"get_psad_auto_blocked_ips: nft query failed: {exc}")
         return []
 
     try:
@@ -1425,8 +1425,188 @@ def get_psad_blocked_ips() -> list:
                     "bytes": (counter or {}).get("bytes", 0),
                 }
     except Exception as exc:
-        log.debug(f"get_psad_blocked_ips: parse failed: {exc}")
+        log.debug(f"get_psad_auto_blocked_ips: parse failed: {exc}")
 
+    return list(blocked.values())
+
+
+# ── dashboard-managed manual blocks ──────────────────────────────────────────
+#
+# Kept in a dedicated nftables table this dashboard fully owns, independent
+# of psad's own PSAD_BLOCK_* chains (which psad creates lazily on its first
+# auto-block and manages the lifecycle of — inserting into them ourselves
+# would risk racing psad's own bootstrap). Runs at a lower priority than
+# both psad's table and our hand-tuned firewall, so a manual block takes
+# effect immediately regardless of what either of those decide.
+
+_DASHBOARD_BLOCKS_TABLE_READY = False
+MANUAL_BLOCKS_EVENTS_FILE = BASE_DIR / "psad_manual_events.json"
+_manual_events_lock = threading.Lock()
+
+
+def _ensure_dashboard_blocks_table() -> None:
+    """Idempotently create the dashboard's own manual-block table/chains."""
+    global _DASHBOARD_BLOCKS_TABLE_READY
+    if _DASHBOARD_BLOCKS_TABLE_READY:
+        return
+    cmds = [
+        ["nft", "add", "table", "inet", "dashboard_blocks"],
+        ["nft", "add", "set", "inet", "dashboard_blocks", "manual_blocked",
+         "{ type ipv4_addr; }"],
+        ["nft", "add", "chain", "inet", "dashboard_blocks", "input",
+         "{ type filter hook input priority -10; policy accept; }"],
+        ["nft", "add", "chain", "inet", "dashboard_blocks", "forward",
+         "{ type filter hook forward priority -10; policy accept; }"],
+    ]
+    for cmd in cmds:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            log.warning(f"_ensure_dashboard_blocks_table: {' '.join(cmd)} -> {result.stderr.strip()}")
+    # Rules referencing the set are only added once the set exists; adding
+    # a duplicate rule is harmless (nft dedupes identical rule bodies here
+    # only if we check first, so guard with a chain listing).
+    check = subprocess.run(
+        ["nft", "-j", "list", "chain", "inet", "dashboard_blocks", "input"],
+        capture_output=True, text=True, timeout=5
+    )
+    has_drop_rule = False
+    if check.returncode == 0 and check.stdout.strip():
+        try:
+            data = json.loads(check.stdout)
+            for item in data.get("nftables", []):
+                rule = item.get("rule")
+                if rule and "drop" in json.dumps(rule.get("expr", [])):
+                    has_drop_rule = True
+        except Exception:
+            pass
+    if not has_drop_rule:
+        subprocess.run(
+            ["nft", "add", "rule", "inet", "dashboard_blocks", "input",
+             "ip saddr @manual_blocked drop"],
+            capture_output=True, text=True, timeout=5
+        )
+        subprocess.run(
+            ["nft", "add", "rule", "inet", "dashboard_blocks", "forward",
+             "ip saddr @manual_blocked drop"],
+            capture_output=True, text=True, timeout=5
+        )
+    _DASHBOARD_BLOCKS_TABLE_READY = True
+
+
+def get_manual_blocked_ips() -> list:
+    """Return IPs currently blocked via the dashboard's manual-block set."""
+    _ensure_dashboard_blocks_table()
+    try:
+        result = subprocess.run(
+            ["nft", "-j", "list", "set", "inet", "dashboard_blocks", "manual_blocked"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        data = json.loads(result.stdout)
+    except Exception as exc:
+        log.debug(f"get_manual_blocked_ips: nft query failed: {exc}")
+        return []
+
+    ips = []
+    try:
+        for item in data.get("nftables", []):
+            s = item.get("set")
+            if not s or s.get("name") != "manual_blocked":
+                continue
+            for elem in s.get("elem", []):
+                if isinstance(elem, str):
+                    ips.append(elem)
+                elif isinstance(elem, dict) and "elem" in elem:
+                    val = elem["elem"].get("val") if isinstance(elem["elem"], dict) else elem["elem"]
+                    if isinstance(val, str):
+                        ips.append(val)
+    except Exception as exc:
+        log.debug(f"get_manual_blocked_ips: parse failed: {exc}")
+
+    return ips
+
+
+def _load_manual_events() -> list:
+    with _manual_events_lock:
+        if not MANUAL_BLOCKS_EVENTS_FILE.exists():
+            return []
+        try:
+            return json.loads(MANUAL_BLOCKS_EVENTS_FILE.read_text())
+        except Exception:
+            return []
+
+
+def _append_manual_event(event: dict) -> None:
+    with _manual_events_lock:
+        events = []
+        if MANUAL_BLOCKS_EVENTS_FILE.exists():
+            try:
+                events = json.loads(MANUAL_BLOCKS_EVENTS_FILE.read_text())
+            except Exception:
+                events = []
+        events.append(event)
+        events = events[-200:]  # keep the file bounded
+        MANUAL_BLOCKS_EVENTS_FILE.write_text(json.dumps(events, indent=2))
+
+
+def psad_manual_block(ip: str) -> tuple[bool, str]:
+    """Manually block an IP via the dashboard's own nftables set."""
+    if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
+        return False, "Invalid IP address"
+
+    _ensure_dashboard_blocks_table()
+    result = subprocess.run(
+        ["nft", "add", "element", "inet", "dashboard_blocks", "manual_blocked",
+         "{ " + ip + " }"],
+        capture_output=True, text=True, timeout=5
+    )
+    if result.returncode != 0:
+        return False, result.stderr.strip() or "nft command failed"
+
+    _append_manual_event({
+        "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "type": "manual_block",
+        "ip": ip,
+        "detail": "Manually blocked from dashboard",
+    })
+    return True, "Blocked"
+
+
+def psad_manual_unblock(ip: str) -> tuple[bool, str]:
+    """Remove a manual block for an IP."""
+    if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
+        return False, "Invalid IP address"
+
+    _ensure_dashboard_blocks_table()
+    result = subprocess.run(
+        ["nft", "delete", "element", "inet", "dashboard_blocks", "manual_blocked",
+         "{ " + ip + " }"],
+        capture_output=True, text=True, timeout=5
+    )
+    if result.returncode != 0:
+        return False, result.stderr.strip() or "nft command failed"
+
+    _append_manual_event({
+        "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "type": "manual_unblock",
+        "ip": ip,
+        "detail": "Manually unblocked from dashboard",
+    })
+    return True, "Unblocked"
+
+
+def get_psad_blocked_ips() -> list:
+    """Return all currently-blocked IPs, from both psad's own auto-blocks
+    and the dashboard's manual-block set, tagged with their source."""
+    blocked = {}
+    for entry in get_psad_auto_blocked_ips():
+        blocked[entry["ip"]] = {**entry, "source": "psad"}
+    for ip in get_manual_blocked_ips():
+        if ip in blocked:
+            blocked[ip]["source"] = "psad+manual"
+        else:
+            blocked[ip] = {"ip": ip, "packets": 0, "bytes": 0, "source": "manual"}
     return list(blocked.values())
 
 
@@ -1443,64 +1623,76 @@ _PSAD_RE_SIG = re.compile(
 
 
 def get_psad_activity(n: int = 25) -> dict:
-    """Return psad's currently-blocked IPs and a parsed recent-activity feed.
+    """Return currently-blocked IPs and a merged recent-activity feed.
 
     Parses recent 'psad' journal entries directly rather than psad's own
     per-attacker files under /var/log/psad/ — the three log line formats
     psad emits (signature match, scan detected, auto-block) are stable and
     simple to match, and this avoids depending on root-owned per-IP
-    tracking file layouts that can change between psad versions.
+    tracking file layouts that can change between psad versions. Merges in
+    dashboard-initiated manual block/unblock events from their own local
+    log, and flags every event whose IP has been blocked (by psad or
+    manually) anywhere in this window as "resolved" — even if that block
+    has since expired — so past scan/signature entries for a handled
+    attacker read as taken care of, not just its live block state.
     """
-    if _run(["systemctl", "is-active", "psad"]) != "active":
-        return {"enabled": False, "events": [], "currently_blocked": []}
+    psad_active = _run(["systemctl", "is-active", "psad"]) == "active"
 
     events = []
-    try:
-        result = subprocess.run(
-            ["journalctl", "-u", "psad", "-n", "200", "--no-pager", "-o", "short-iso"],
-            capture_output=True, text=True, timeout=5
-        )
-        lines = result.stdout.splitlines() if result.returncode == 0 else []
-    except Exception as exc:
-        log.debug(f"get_psad_activity: journalctl failed: {exc}")
-        lines = []
+    if psad_active:
+        try:
+            result = subprocess.run(
+                ["journalctl", "-u", "psad", "-n", "200", "--no-pager", "-o", "short-iso"],
+                capture_output=True, text=True, timeout=5
+            )
+            lines = result.stdout.splitlines() if result.returncode == 0 else []
+        except Exception as exc:
+            log.debug(f"get_psad_activity: journalctl failed: {exc}")
+            lines = []
 
-    for line in lines:
-        m = _PSAD_LOG_LINE_RE.match(line)
-        if not m:
-            continue
-        ts, msg = m.group(1), m.group(2)
+        for line in lines:
+            m = _PSAD_LOG_LINE_RE.match(line)
+            if not m:
+                continue
+            ts, msg = m.group(1), m.group(2)
 
-        bm = _PSAD_RE_BLOCK.search(msg)
-        if bm:
-            mins = int(bm.group("seconds")) // 60
-            events.append({
-                "timestamp": ts, "type": "auto_block", "ip": bm.group("ip"),
-                "detail": f"Blocked for {mins} min" if mins else "Blocked",
-            })
-            continue
+            bm = _PSAD_RE_BLOCK.search(msg)
+            if bm:
+                mins = int(bm.group("seconds")) // 60
+                events.append({
+                    "timestamp": ts, "type": "auto_block", "ip": bm.group("ip"),
+                    "detail": f"Blocked for {mins} min" if mins else "Blocked",
+                })
+                continue
 
-        sm = _PSAD_RE_SCAN.search(msg)
-        if sm:
-            events.append({
-                "timestamp": ts, "type": "scan_detected", "ip": sm.group("src"),
-                "detail": f"{sm.group('scan_type')} → {sm.group('proto')}/{sm.group('ports')} (DL{sm.group('dl')})",
-            })
-            continue
+            sm = _PSAD_RE_SCAN.search(msg)
+            if sm:
+                events.append({
+                    "timestamp": ts, "type": "scan_detected", "ip": sm.group("src"),
+                    "detail": f"{sm.group('scan_type')} → {sm.group('proto')}/{sm.group('ports')} (DL{sm.group('dl')})",
+                })
+                continue
 
-        gm = _PSAD_RE_SIG.search(msg)
-        if gm:
-            events.append({
-                "timestamp": ts, "type": "signature_match", "ip": gm.group("ip"),
-                "detail": f"{gm.group('sig')} ({gm.group('proto')}/{gm.group('port')})",
-            })
-            continue
+            gm = _PSAD_RE_SIG.search(msg)
+            if gm:
+                events.append({
+                    "timestamp": ts, "type": "signature_match", "ip": gm.group("ip"),
+                    "detail": f"{gm.group('sig')} ({gm.group('proto')}/{gm.group('port')})",
+                })
+                continue
+
+    events.extend(_load_manual_events())
+    events.sort(key=lambda ev: ev.get("timestamp", ""))
+
+    resolved_ips = {ev["ip"] for ev in events if ev["type"] in ("auto_block", "manual_block")}
+    for ev in events:
+        ev["resolved"] = ev["ip"] in resolved_ips
 
     events = events[-n:]
     events.reverse()
 
     return {
-        "enabled": True,
+        "enabled": psad_active,
         "events": events,
         "currently_blocked": get_psad_blocked_ips(),
     }
@@ -1584,6 +1776,22 @@ def api_clients():
 @app.route("/api/psad")
 def api_psad():
     return jsonify(get_psad_activity())
+
+
+@app.route("/api/psad/block", methods=["POST"])
+def api_psad_block():
+    data = request.get_json(force=True) or {}
+    ip = str(data.get("ip", "")).strip()
+    ok, msg = psad_manual_block(ip)
+    return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+
+
+@app.route("/api/psad/unblock", methods=["POST"])
+def api_psad_unblock():
+    data = request.get_json(force=True) or {}
+    ip = str(data.get("ip", "")).strip()
+    ok, msg = psad_manual_unblock(ip)
+    return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
 
 
 @app.route("/api/pihole")

@@ -844,8 +844,53 @@ main.grid {
 }
 
 .psad-log-line.psad-type-auto_block      { border-left-color: var(--red); }
+.psad-log-line.psad-type-manual_block    { border-left-color: var(--red); }
+.psad-log-line.psad-type-manual_unblock  { border-left-color: var(--green); }
 .psad-log-line.psad-type-scan_detected   { border-left-color: var(--yellow); }
 .psad-log-line.psad-type-signature_match { border-left-color: var(--orange); }
+
+.psad-log-line.psad-resolved {
+  background: rgba(248, 81, 73, .08);
+  border-left-color: var(--red);
+}
+
+.psad-log-line.psad-resolved .psad-log-ip {
+  color: var(--red);
+}
+
+.psad-action-btn {
+  flex: 0 0 auto;
+  font-family: var(--font-sans, inherit);
+  font-size: .68rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: .3px;
+}
+
+.psad-block-btn {
+  background: transparent;
+  border: 1px solid var(--red);
+  color: var(--red);
+}
+
+.psad-block-btn:hover {
+  background: var(--red);
+  color: #fff;
+}
+
+.psad-unblock-btn {
+  background: transparent;
+  border: 1px solid var(--green);
+  color: var(--green);
+}
+
+.psad-unblock-btn:hover {
+  background: var(--green);
+  color: #000;
+}
 
 .psad-log-icon {
   flex: 0 0 auto;

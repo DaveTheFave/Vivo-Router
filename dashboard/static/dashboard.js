@@ -415,7 +415,12 @@ function renderGatewayTimeout(monitor) {
 }
 
 // ── psad scan detection ──────────────────────────────────────────────────────
-const PSAD_TYPE_ICON = { auto_block: "🚫", scan_detected: "🔍", signature_match: "⚠" };
+const PSAD_TYPE_ICON = {
+  auto_block: "🚫", manual_block: "🚫", manual_unblock: "✅",
+  scan_detected: "🔍", signature_match: "⚠",
+};
+
+let _psadBlockedIps = new Set();
 
 function renderPsad(psad) {
   const badge = document.getElementById("psad-status-badge");
@@ -427,6 +432,7 @@ function renderPsad(psad) {
 
   const blocked = Array.isArray(psad.currently_blocked) ? psad.currently_blocked : [];
   setText("psad-blocked-count", String(blocked.length));
+  _psadBlockedIps = new Set(blocked.map(b => b.ip));
 
   const events = Array.isArray(psad.events) ? psad.events : [];
   setText("psad-event-count", String(events.length));
@@ -435,7 +441,7 @@ function renderPsad(psad) {
   if (blockedListEl) {
     blockedListEl.innerHTML = blocked.map(b => {
       const pkts = fmtNum(b.packets);
-      return `<span class="psad-blocked-chip" title="${escHtml(pkts)} packets dropped since block">🚫 ${escHtml(b.ip)}</span>`;
+      return `<span class="psad-blocked-chip" title="${escHtml(pkts)} packets dropped since block · source: ${escHtml(b.source || "?")}">🚫 ${escHtml(b.ip)}</span>`;
     }).join("");
   }
 
@@ -450,14 +456,61 @@ function renderPsad(psad) {
   const lines = events.slice(0, 20).map(ev => {
     const icon = PSAD_TYPE_ICON[ev.type] || "•";
     const ts = fmtTimestamp(ev.timestamp);
-    return `<div class="psad-log-line psad-type-${escHtml(ev.type || "")}">` +
+    const resolvedClass = ev.resolved ? " psad-resolved" : "";
+    const ip = ev.ip || "";
+    const isBlocked = _psadBlockedIps.has(ip);
+    const actionBtn = ip
+      ? (isBlocked
+          ? `<button class="psad-action-btn psad-unblock-btn" onclick="psadUnblock('${escHtml(ip)}')">Unblock</button>`
+          : `<button class="psad-action-btn psad-block-btn" onclick="psadBlock('${escHtml(ip)}')">Block</button>`)
+      : "";
+    return `<div class="psad-log-line psad-type-${escHtml(ev.type || "")}${resolvedClass}">` +
       `<span class="psad-log-icon">${icon}</span>` +
-      `<span class="psad-log-ip">${escHtml(ev.ip || "")}</span>` +
+      `<span class="psad-log-ip">${escHtml(ip)}</span>` +
       `<span class="psad-log-detail">${escHtml(ev.detail || "")}</span>` +
       `<span class="psad-log-ts">${escHtml(ts)}</span>` +
+      actionBtn +
       `</div>`;
   });
   logEl.innerHTML = lines.join("");
+}
+
+async function psadBlock(ip) {
+  try {
+    const resp = await fetch("/api/psad/block", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ip }),
+    });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      alert("Block failed: " + (body.message || resp.status));
+      return;
+    }
+  } catch (err) {
+    alert("Block failed: " + err);
+    return;
+  }
+  fetchStats(false);
+}
+
+async function psadUnblock(ip) {
+  try {
+    const resp = await fetch("/api/psad/unblock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ip }),
+    });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      alert("Unblock failed: " + (body.message || resp.status));
+      return;
+    }
+  } catch (err) {
+    alert("Unblock failed: " + err);
+    return;
+  }
+  fetchStats(false);
 }
 
 // ── power / battery monitoring ─────────────────────────────────────────────────

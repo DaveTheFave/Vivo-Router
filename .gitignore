@@ -14,3 +14,4 @@ dashboard/port_forwards.json
 # OS
 .DS_Store
 Thumbs.db
+dashboard/psad_manual_events.json
