@@ -1379,6 +1379,133 @@ def _parse_nft_text() -> list:
     return rules
 
 
+def get_psad_blocked_ips() -> list:
+    """Query nftables for IPs currently auto-blocked by psad.
+
+    psad's iptables-nft compat layer manages a separate 'ip filter' table
+    (distinct from our own 'inet filter' table) — reading that directly
+    reflects live block state, rather than parsing psad's own bookkeeping
+    files which may lag or include already-expired entries.
+    """
+    blocked: dict = {}
+    try:
+        result = subprocess.run(
+            ["nft", "-j", "list", "table", "ip", "filter"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        data = json.loads(result.stdout)
+    except Exception as exc:
+        log.debug(f"get_psad_blocked_ips: nft query failed: {exc}")
+        return []
+
+    try:
+        for item in data.get("nftables", []):
+            rule = item.get("rule")
+            if not rule or rule.get("chain") != "PSAD_BLOCK_INPUT":
+                continue
+            ip = None
+            counter = None
+            for expr in rule.get("expr", []):
+                if not isinstance(expr, dict):
+                    continue
+                if "match" in expr:
+                    left = expr["match"].get("left", {})
+                    right = expr["match"].get("right")
+                    if isinstance(left, dict) and left.get("payload", {}).get("field") == "saddr":
+                        if isinstance(right, str):
+                            ip = right
+                if "counter" in expr:
+                    counter = expr["counter"]
+            if ip:
+                blocked[ip] = {
+                    "ip": ip,
+                    "packets": (counter or {}).get("packets", 0),
+                    "bytes": (counter or {}).get("bytes", 0),
+                }
+    except Exception as exc:
+        log.debug(f"get_psad_blocked_ips: parse failed: {exc}")
+
+    return list(blocked.values())
+
+
+_PSAD_LOG_LINE_RE = re.compile(r'^(\S+)\s+\S+\s+psad\[\d+\]:\s*(.*)$')
+_PSAD_RE_BLOCK = re.compile(r'added iptables auto-block against (?P<ip>\S+) for (?P<seconds>\d+) seconds')
+_PSAD_RE_SCAN = re.compile(
+    r'scan detected \((?P<scan_type>[^)]+)\): (?P<src>\S+) -> (?P<dst>\S+) '
+    r'(?P<proto>\w+): \[(?P<ports>[\d,]+)\].*?DL: (?P<dl>\d+)'
+)
+_PSAD_RE_SIG = re.compile(
+    r'src: (?P<ip>\S+) signature match: "(?P<sig>[^"]+)" \(sid: (?P<sid>\d+)\) '
+    r'(?P<proto>\w+) port: (?P<port>\d+)'
+)
+
+
+def get_psad_activity(n: int = 25) -> dict:
+    """Return psad's currently-blocked IPs and a parsed recent-activity feed.
+
+    Parses recent 'psad' journal entries directly rather than psad's own
+    per-attacker files under /var/log/psad/ — the three log line formats
+    psad emits (signature match, scan detected, auto-block) are stable and
+    simple to match, and this avoids depending on root-owned per-IP
+    tracking file layouts that can change between psad versions.
+    """
+    if _run(["systemctl", "is-active", "psad"]) != "active":
+        return {"enabled": False, "events": [], "currently_blocked": []}
+
+    events = []
+    try:
+        result = subprocess.run(
+            ["journalctl", "-u", "psad", "-n", "200", "--no-pager", "-o", "short-iso"],
+            capture_output=True, text=True, timeout=5
+        )
+        lines = result.stdout.splitlines() if result.returncode == 0 else []
+    except Exception as exc:
+        log.debug(f"get_psad_activity: journalctl failed: {exc}")
+        lines = []
+
+    for line in lines:
+        m = _PSAD_LOG_LINE_RE.match(line)
+        if not m:
+            continue
+        ts, msg = m.group(1), m.group(2)
+
+        bm = _PSAD_RE_BLOCK.search(msg)
+        if bm:
+            mins = int(bm.group("seconds")) // 60
+            events.append({
+                "timestamp": ts, "type": "auto_block", "ip": bm.group("ip"),
+                "detail": f"Blocked for {mins} min" if mins else "Blocked",
+            })
+            continue
+
+        sm = _PSAD_RE_SCAN.search(msg)
+        if sm:
+            events.append({
+                "timestamp": ts, "type": "scan_detected", "ip": sm.group("src"),
+                "detail": f"{sm.group('scan_type')} → {sm.group('proto')}/{sm.group('ports')} (DL{sm.group('dl')})",
+            })
+            continue
+
+        gm = _PSAD_RE_SIG.search(msg)
+        if gm:
+            events.append({
+                "timestamp": ts, "type": "signature_match", "ip": gm.group("ip"),
+                "detail": f"{gm.group('sig')} ({gm.group('proto')}/{gm.group('port')})",
+            })
+            continue
+
+    events = events[-n:]
+    events.reverse()
+
+    return {
+        "enabled": True,
+        "events": events,
+        "currently_blocked": get_psad_blocked_ips(),
+    }
+
+
 def get_recent_errors(n: int = 20) -> list:
     """
     Return the last n error/warning lines from dnsmasq and syslog.
@@ -1423,6 +1550,7 @@ def api_stats():
     errors = get_recent_errors()
     health = get_health_checks()
     gateway_timeout = gateway_timeout_tracker.update(health.get("gateway", {}))
+    psad = get_psad_activity()
 
     wan_iface = CONF["WAN_IFACE"]
     lan_iface = CONF["LAN_IFACE"]
@@ -1444,12 +1572,18 @@ def api_stats():
         "recent_errors": errors,
         "health": health,
         "gateway_timeout": gateway_timeout,
+        "psad": psad,
     })
 
 
 @app.route("/api/clients")
 def api_clients():
     return jsonify(get_active_clients(resolve_names=True))
+
+
+@app.route("/api/psad")
+def api_psad():
+    return jsonify(get_psad_activity())
 
 
 @app.route("/api/pihole")

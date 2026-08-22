@@ -744,6 +744,136 @@ main.grid {
   font-style: italic;
 }
 
+/* ── psad scan detection ─────────────────────────────────────────────────── */
+.psad-status-badge {
+  font-size: .75rem;
+  font-weight: 700;
+  padding: 2px 10px;
+  border-radius: 20px;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+}
+
+.psad-status-badge.active   { background: var(--green);   color: #000; }
+.psad-status-badge.disabled { background: var(--surface2); color: var(--text-muted); border: 1px solid var(--border); }
+
+.psad-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+}
+
+.psad-stat {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.psad-label {
+  font-size: .72rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: .4px;
+}
+
+.psad-value {
+  font-size: .9rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.psad-blocked-list {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.psad-blocked-chip {
+  background: rgba(248, 81, 73, .15);
+  border: 1px solid var(--red);
+  color: var(--red);
+  border-radius: 20px;
+  padding: 3px 10px;
+  font-size: .76rem;
+  font-family: var(--font-mono);
+}
+
+.psad-section-label {
+  margin-top: 12px;
+  margin-bottom: 6px;
+  font-size: .72rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: .4px;
+}
+
+.psad-log {
+  max-height: 220px;
+  overflow-y: auto;
+  background: #0a0d12;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  padding: 6px 8px;
+  font-family: var(--font-mono);
+  font-size: .76rem;
+}
+
+.psad-log-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 2px;
+  border-bottom: 1px solid rgba(48,54,61,.35);
+  border-left: 3px solid transparent;
+  padding-left: 6px;
+}
+
+.psad-log-line:last-child {
+  border-bottom: none;
+}
+
+.psad-log-line.empty {
+  color: var(--text-muted);
+  font-style: italic;
+  border-left: none;
+}
+
+.psad-log-line.psad-type-auto_block      { border-left-color: var(--red); }
+.psad-log-line.psad-type-scan_detected   { border-left-color: var(--yellow); }
+.psad-log-line.psad-type-signature_match { border-left-color: var(--orange); }
+
+.psad-log-icon {
+  flex: 0 0 auto;
+}
+
+.psad-log-ip {
+  flex: 0 0 auto;
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.psad-log-detail {
+  flex: 1 1 auto;
+  color: var(--text-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.psad-log-ts {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: .7rem;
+  white-space: nowrap;
+}
+
 /* ── battery badge (header) ───────────────────────────────────────────────── */
 .battery-badge {
   font-size: .82rem;

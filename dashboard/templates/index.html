@@ -353,6 +353,29 @@
       </div>
     </div>
 
+    <!-- PSAD scan detection panel -->
+    <div class="panel" id="psad-panel">
+      <div class="panel-header">
+        <span class="panel-title">🛡 PSAD — Scan Detection</span>
+        <span class="psad-status-badge" id="psad-status-badge">–</span>
+      </div>
+      <div class="psad-grid">
+        <div class="psad-stat">
+          <span class="psad-label">Currently Blocked</span>
+          <strong class="psad-value" id="psad-blocked-count">0</strong>
+        </div>
+        <div class="psad-stat">
+          <span class="psad-label">Recent Events</span>
+          <strong class="psad-value" id="psad-event-count">0</strong>
+        </div>
+      </div>
+      <div class="psad-blocked-list" id="psad-blocked-list"></div>
+      <div class="psad-section-label">Recent Activity</div>
+      <div class="psad-log" id="psad-log">
+        <div class="psad-log-line empty">No scan activity recorded.</div>
+      </div>
+    </div>
+
     <!-- Recent errors panel -->
     <div class="panel">
       <div class="panel-header">

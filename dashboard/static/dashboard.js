@@ -89,6 +89,7 @@ async function fetchStats(resolveNames = false) {
   renderPihole(data.pihole || {});
   renderHealth(data);
   renderGatewayTimeout(data.gateway_timeout || {});
+  renderPsad(data.psad || {});
   renderErrors(data.recent_errors || []);
   setText("last-updated", "Last updated: " + new Date().toLocaleTimeString());
 }
@@ -410,6 +411,52 @@ function renderGatewayTimeout(monitor) {
     return `<div class="gtw-log-line">${escHtml(started)} → ${escHtml(ended)} · ${escHtml(duration)}</div>`;
   });
 
+  logEl.innerHTML = lines.join("");
+}
+
+// ── psad scan detection ──────────────────────────────────────────────────────
+const PSAD_TYPE_ICON = { auto_block: "🚫", scan_detected: "🔍", signature_match: "⚠" };
+
+function renderPsad(psad) {
+  const badge = document.getElementById("psad-status-badge");
+  const enabled = Boolean(psad.enabled);
+  if (badge) {
+    badge.className = "psad-status-badge " + (enabled ? "active" : "disabled");
+    badge.textContent = enabled ? "Active" : "Disabled";
+  }
+
+  const blocked = Array.isArray(psad.currently_blocked) ? psad.currently_blocked : [];
+  setText("psad-blocked-count", String(blocked.length));
+
+  const events = Array.isArray(psad.events) ? psad.events : [];
+  setText("psad-event-count", String(events.length));
+
+  const blockedListEl = document.getElementById("psad-blocked-list");
+  if (blockedListEl) {
+    blockedListEl.innerHTML = blocked.map(b => {
+      const pkts = fmtNum(b.packets);
+      return `<span class="psad-blocked-chip" title="${escHtml(pkts)} packets dropped since block">🚫 ${escHtml(b.ip)}</span>`;
+    }).join("");
+  }
+
+  const logEl = document.getElementById("psad-log");
+  if (!logEl) return;
+
+  if (events.length === 0) {
+    logEl.innerHTML = '<div class="psad-log-line empty">No scan activity recorded.</div>';
+    return;
+  }
+
+  const lines = events.slice(0, 20).map(ev => {
+    const icon = PSAD_TYPE_ICON[ev.type] || "•";
+    const ts = fmtTimestamp(ev.timestamp);
+    return `<div class="psad-log-line psad-type-${escHtml(ev.type || "")}">` +
+      `<span class="psad-log-icon">${icon}</span>` +
+      `<span class="psad-log-ip">${escHtml(ev.ip || "")}</span>` +
+      `<span class="psad-log-detail">${escHtml(ev.detail || "")}</span>` +
+      `<span class="psad-log-ts">${escHtml(ts)}</span>` +
+      `</div>`;
+  });
   logEl.innerHTML = lines.join("");
 }
 
