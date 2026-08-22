@@ -70,10 +70,11 @@ function setBar(id, pct) {
 }
 
 // ── main fetch ────────────────────────────────────────────────────────────────
-async function fetchStats() {
+async function fetchStats(resolveNames = false) {
   let data;
   try {
-    const resp = await fetch("/api/stats", { cache: "no-store" });
+    const suffix = resolveNames ? "?resolve_names=1" : "";
+    const resp = await fetch("/api/stats" + suffix, { cache: "no-store" });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     data = await resp.json();
   } catch (err) {
@@ -813,9 +814,9 @@ function escHtml(str) {
 }
 
 // ── polling loop ──────────────────────────────────────────────────────────────
-fetchStats();
+fetchStats(true);
 renderTrends();
 fetchPortForwards();
-setInterval(fetchStats, REFRESH_MS);
+setInterval(() => fetchStats(false), REFRESH_MS);
 setInterval(renderTrends, 10000);
 setInterval(fetchPortForwards, 10000);

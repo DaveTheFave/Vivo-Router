@@ -216,6 +216,69 @@ def _run(cmd: list[str], fallback: str = "") -> str:
         return fallback
 
 
+_pihole_ptr_cache: dict = {"data": {}, "expires": 0.0}
+PIHOLE_PTR_CACHE_TTL = 30  # seconds — avoid repeated PTR lookups
+
+
+def _pihole_dns_server() -> str:
+    """Return the DNS server address used for PTR lookups."""
+    explicit = (CONF.get("PIHOLE_DNS_SERVER") or "").strip()
+    if explicit:
+        return explicit
+
+    api_url = (CONF.get("PIHOLE_API") or "").strip()
+    if api_url:
+        hostname = urllib.parse.urlparse(api_url).hostname
+        if hostname:
+            return hostname
+
+    return "127.0.0.1"
+
+
+def _resolve_pihole_ptr(ip: str) -> str | None:
+    """Resolve a client name by querying Pi-hole's DNS server directly."""
+    if not ip:
+        return None
+
+    now = time.time()
+    cached = _pihole_ptr_cache["data"].get(ip)
+    if cached and now < cached[1]:
+        return cached[0]
+
+    server = _pihole_dns_server()
+    candidates = [
+        ["dig", "+time=2", "+tries=1", "+short", "-x", ip, f"@{server}"],
+        ["getent", "hosts", ip],
+    ]
+
+    hostname = None
+    for cmd in candidates:
+        out = _run(cmd).strip()
+        if not out:
+            continue
+        line = out.splitlines()[0].strip()
+        if not line:
+            continue
+        if cmd[0] == "dig":
+            hostname = line.rstrip(".")
+            break
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].endswith("."):
+            hostname = parts[1].rstrip(".")
+            break
+
+    if hostname and hostname not in {"*", "(unknown)"}:
+        _pihole_ptr_cache["data"][ip] = (hostname, now + PIHOLE_PTR_CACHE_TTL)
+        return hostname
+
+    return None
+
+
+def resolve_hostname_pihole(ip: str) -> str | None:
+    """Resolve a client hostname from Pi-hole's DNS resolver."""
+    return _resolve_pihole_ptr(ip)
+
+
 # ── data collectors ───────────────────────────────────────────────────────────
 
 def get_wan_ip() -> str:
@@ -543,10 +606,15 @@ def resolve_hostname_reverse_dns(ip: str, timeout: float = 1.5) -> str | None:
 def get_hostname(ip: str, timeout: float = 2.0) -> str | None:
     """Resolve hostname with fallback chain.
 
-    1. Try avahi-resolve (mDNS) — primary for local network
-    2. Try reverse DNS — fallback
-    3. Return None if all fail
+    1. Try Pi-hole DNS PTR lookups (conditional forwarding)
+    2. Try avahi-resolve (mDNS) — primary for local network
+    3. Try reverse DNS — fallback
+    4. Return None if all fail
     """
+    hostname = resolve_hostname_pihole(ip)
+    if hostname:
+        return hostname
+
     # Try mDNS first (fast on LANs)
     hostname = resolve_hostname_avahi(ip, timeout * 0.7)
     if hostname:
@@ -596,89 +664,113 @@ def get_hostnames_batch(ips: list, timeout: float = 1.5, max_workers: int = 5) -
     return results
 
 
+class HostnameRefresher:
+    """Periodically re-resolve hostnames for currently-seen clients in the
+    background, independent of any HTTP request.
+
+    The dashboard frontend only asks for a synchronous resolve on first page
+    load; a kiosk display that never reloads would otherwise never refresh
+    names again, leaving new/renamed clients stuck showing their bare IP.
+    This background loop fixes that without changing the request-time
+    behavior or the per-IP resolution rate: it defers to the existing
+    HOSTNAME_CACHE_TTL, so each client's hostname is still looked up (mDNS /
+    Pi-hole PTR / reverse DNS) at most once per TTL window — the same cadence
+    already relied on to keep PTR query volume low after we previously
+    overwhelmed the DNS server with lookups.
+    """
+
+    def __init__(self, interval: float = 60.0):
+        self._interval = interval
+        self._thread = threading.Thread(target=self._run, name="hostname-refresher", daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            try:
+                arp_clients = get_arp_clients()
+                ips = [c["ip"] for c in arp_clients.values()]
+                now = time.time()
+                stale = [ip for ip in ips
+                         if ip not in _hostname_cache
+                         or now - _hostname_cache[ip][1] >= HOSTNAME_CACHE_TTL]
+                if stale:
+                    fresh = get_hostnames_batch(stale, timeout=1.5, max_workers=5)
+                    for ip, hostname in fresh.items():
+                        _hostname_cache[ip] = (hostname, now)
+            except Exception as exc:
+                log.warning("HostnameRefresher error: %s", exc)
+            time.sleep(self._interval)
+
+
+_hostname_refresher = HostnameRefresher(interval=60.0)
+_hostname_refresher.start()
+
+
 # ── per-client bandwidth tracking via nftables counters ─────────────────────
 
+def _extract_nft_counter_bytes(expr: dict) -> int | None:
+    """Return the byte count from an nftables JSON 'counter' expression, if present."""
+    counter = expr.get("counter")
+    if not isinstance(counter, dict):
+        return None
+    return counter.get("bytes", 0)
+
+
+def _extract_nft_comment(expr: dict) -> str | None:
+    """Return the comment string attached to an nftables JSON rule expression, if present."""
+    comment = expr.get("comment")
+    if isinstance(comment, str):
+        return comment
+    return None
+
+
 class ClientBandwidthTracker:
-    """Track per-client bandwidth using nftables counters."""
+    """Track per-client bandwidth using nftables counters.
+
+    Existence of counter rules is checked against the *live* nftables
+    ruleset on every poll, not against in-process memory. That makes this
+    self-healing after anything external flushes or reloads nftables (a
+    `systemctl restart nftables`, a boot, a manual `nft -f` load) instead of
+    permanently believing rules exist that are actually gone. It also fixes
+    the previous behavior of re-adding a full duplicate set of counter rules
+    on every dashboard process restart, since the live ruleset — not a
+    dict that resets to empty on restart — is now the source of truth for
+    what already exists.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._tracked_ips: dict = {}  # {ip: timestamp_added}
-        self._counters_cache: dict = {}  # {ip: {rx_bytes, tx_bytes, ts}}
-        self._last_sample_time: float = 0
-        self._sample_interval: float = 5  # Sample every 5 seconds
+        self._counters_cache: dict = {}  # {ip: {tx_bytes, rx_bytes, ts}}
+        self._last_seen: dict = {}  # {ip: last_seen_ts}
 
-    def ensure_rules(self, client_ips: list, lan_iface: str):
-        """Ensure nftables rules exist for each client IP.
-
-        Creates rules like:
-          ip saddr {ip} counter  (track uploads/tx)
-          ip daddr {ip} counter  (track downloads/rx)
-        """
-        with self._lock:
-            now = time.time()
-            new_ips = set(client_ips) - set(self._tracked_ips.keys())
-
-            for ip in new_ips:
-                try:
-                    # Validate IP format
-                    if not re.match(r"\d{1,3}(\.\d{1,3}){3}", ip):
-                        log.warning(f"Invalid IP format: {ip}")
-                        continue
-
-                    # Add rule to track outbound traffic from client (upload)
-                    result = subprocess.run(
-                        ["nft", "add", "rule", "inet", "filter", "forward",
-                         f"ip saddr {ip} counter"],
-                        capture_output=True, text=True, timeout=3
-                    )
-                    if result.returncode != 0:
-                        log.warning(f"nft saddr rule failed for {ip}: {result.stderr.strip()}")
-
-                    # Add rule to track inbound traffic to client (download)
-                    result = subprocess.run(
-                        ["nft", "add", "rule", "inet", "filter", "forward",
-                         f"ip daddr {ip} counter"],
-                        capture_output=True, text=True, timeout=3
-                    )
-                    if result.returncode != 0:
-                        log.warning(f"nft daddr rule failed for {ip}: {result.stderr.strip()}")
-
-                    self._tracked_ips[ip] = now
-                    log.debug(f"Added nftables counters for client {ip}")
-                except subprocess.TimeoutExpired:
-                    log.warning(f"nft command timed out for {ip}")
-                except Exception as exc:
-                    log.warning(f"Failed to add nftables rule for {ip}: {exc}")
-
-    def get_bandwidth(self, client_ips: list) -> dict:
-        """Query nftables for per-IP bandwidth data.
-
-        Returns dict mapping IP -> {rx_bytes, tx_bytes, rx_rate, tx_rate}
-        Rates are in bytes/sec.
-        """
-        results = {}
-
+    def _list_ruleset(self) -> dict | None:
         try:
-            # Parse nftables JSON output for counter rules
             result = subprocess.run(
-                ["nft", "-j", "list", "ruleset"],
+                ["nft", "-j", "-a", "list", "ruleset"],
                 capture_output=True, text=True, timeout=5
             )
             if result.returncode != 0 or not result.stdout.strip():
                 log.debug("nftables query returned no data")
-                return results
-
-            data = json.loads(result.stdout)
+                return None
+            return json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             log.warning(f"Failed to parse nftables JSON: {exc}")
-            return results
+            return None
         except Exception as exc:
             log.warning(f"Failed to query nftables: {exc}")
-            return results
+            return None
 
-        # Extract counter values per IP
-        ip_counters = {}  # {ip: {saddr_bytes, daddr_bytes}}
+    def _parse_counters(self, data: dict) -> tuple[dict, dict]:
+        """Extract per-IP counter byte totals and rule handles from `nft -j` output.
+
+        Returns (ip_counters, ip_handles):
+          ip_counters: {ip: {"tx_bytes": n, "rx_bytes": n}}
+          ip_handles:  {ip: {"tx": handle, "rx": handle}}
+        """
+        ip_counters: dict = {}
+        ip_handles: dict = {}
 
         try:
             for item in data.get("nftables", []):
@@ -686,151 +778,187 @@ class ClientBandwidthTracker:
                 if not rule:
                     continue
 
-                table = rule.get("table")
-                chain = rule.get("chain")
+                # Rule "table" is the table *name* (e.g. "filter"); the
+                # address family (e.g. "inet") is a separate "family" key.
+                if rule.get("family") != "inet" or rule.get("table") != "filter":
+                    continue
+                if rule.get("chain") != "forward":
+                    continue
 
-                # Only process inet filter forward rules
-                if table != "inet" or chain != "forward":
+                # A rule's comment (set via `... comment "..."`) is a
+                # top-level key on the rule object itself, not an entry
+                # inside its "expr" list.
+                comment = _extract_nft_comment(rule)
+                if not (comment and comment.startswith("vivo-router:")):
                     continue
 
                 exprs = rule.get("expr", [])
-                if not isinstance(exprs, list) or len(exprs) < 2:
+                if not isinstance(exprs, list):
                     continue
 
-                # Look for pattern: [match expression, counter expression]
-                counter_data = None
-                match_field = None
-                match_ip = None
-
+                counter_bytes = None
                 for expr in exprs:
                     if not isinstance(expr, dict):
                         continue
+                    if counter_bytes is None:
+                        counter_bytes = _extract_nft_counter_bytes(expr)
 
-                    # Check for counter
-                    if "counter" in expr:
-                        counter_data = expr.get("counter", {})
+                if counter_bytes is None:
+                    continue
 
-                    # Check for match expression
-                    if "match" in expr:
-                        match = expr["match"]
-                        if not isinstance(match, dict):
-                            continue
+                _, direction, ip = comment.split(":", 2)
+                if direction not in ("tx", "rx"):
+                    continue
 
-                        left = match.get("left")
-                        right = match.get("right")
-
-                        # Extract field (saddr or daddr) and IP
-                        if isinstance(left, dict):
-                            payload = left.get("payload", {})
-                            field = payload.get("field")
-                            if field in ("saddr", "daddr"):
-                                match_field = field
-                                # right can be string (single IP) or dict/list
-                                if isinstance(right, str) and re.match(r"\d+\.\d+\.\d+\.\d+", right):
-                                    match_ip = right
-
-                # Record if we found both match and counter
-                if counter_data and match_field and match_ip:
-                    if match_ip not in ip_counters:
-                        ip_counters[match_ip] = {}
-                    ip_counters[match_ip][match_field] = counter_data.get("bytes", 0)
-
+                ip_counters.setdefault(ip, {})[f"{direction}_bytes"] = counter_bytes
+                ip_handles.setdefault(ip, {})[direction] = rule.get("handle")
         except Exception as exc:
             log.warning(f"Failed to parse nftables output: {exc}")
 
-        # Combine saddr (tx) and daddr (rx) counters for each IP
+        return ip_counters, ip_handles
+
+    def _ensure_rules(self, missing_ips: set):
+        """Add tx/rx counter rules for client IPs that don't already have them.
+
+        Uses `nft insert` (prepend to chain start), not `nft add` (append to
+        chain end): real traffic already hits a terminating `accept` verdict
+        earlier in the forward chain, so a counter-only rule appended after
+        that point would never actually see a packet. A bare `counter` rule
+        has no verdict of its own, so inserting it ahead of everything else
+        is safe — it just tallies bytes and falls through unchanged.
+        """
+        for ip in missing_ips:
+            if not re.match(r"\d{1,3}(\.\d{1,3}){3}", ip):
+                log.warning(f"Invalid IP format: {ip}")
+                continue
+            try:
+                for direction, field in (("tx", "saddr"), ("rx", "daddr")):
+                    result = subprocess.run(
+                        ["nft", "insert", "rule", "inet", "filter", "forward",
+                         f"ip {field} {ip} counter comment \"vivo-router:{direction}:{ip}\""],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    if result.returncode != 0:
+                        log.warning(f"nft {field} rule failed for {ip}: {result.stderr.strip()}")
+                log.debug(f"Added nftables counters for client {ip}")
+            except subprocess.TimeoutExpired:
+                log.warning(f"nft command timed out for {ip}")
+            except Exception as exc:
+                log.warning(f"Failed to add nftables rule for {ip}: {exc}")
+
+    def _cleanup_stale_rules(self, stale_ips: set, ip_handles: dict):
+        """Actually delete counter rules (by handle) for IPs no longer active."""
+        for ip in stale_ips:
+            for direction, handle in ip_handles.get(ip, {}).items():
+                if handle is None:
+                    continue
+                try:
+                    result = subprocess.run(
+                        ["nft", "delete", "rule", "inet", "filter", "forward", "handle", str(handle)],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    if result.returncode != 0:
+                        log.warning(f"nft delete rule failed for {ip} ({direction}): {result.stderr.strip()}")
+                    else:
+                        log.debug(f"Removed stale counter rule for {ip} ({direction})")
+                except subprocess.TimeoutExpired:
+                    log.warning(f"nft delete timed out for {ip} ({direction})")
+                except Exception as exc:
+                    log.warning(f"Failed to delete stale rule for {ip} ({direction}): {exc}")
+            self._last_seen.pop(ip, None)
+            self._counters_cache.pop(ip, None)
+
+    def poll(self, client_ips: list, stale_timeout: int = 600) -> dict:
+        """Sync counter rules with the currently active client list and
+        return per-IP bandwidth data: {ip: {rx_bytes, tx_bytes, rx_rate, tx_rate}}.
+        """
+        results: dict = {}
         now = time.time()
+
         with self._lock:
             for ip in client_ips:
-                saddr_bytes = ip_counters.get(ip, {}).get("saddr", 0)
-                daddr_bytes = ip_counters.get(ip, {}).get("daddr", 0)
+                self._last_seen[ip] = now
+
+            data = self._list_ruleset()
+            if data is None:
+                return results
+
+            ip_counters, ip_handles = self._parse_counters(data)
+
+            # Rules seen in the ruleset that this process has no memory of
+            # (e.g. right after a restart) get a fresh grace period instead
+            # of being deleted outright.
+            for ip in ip_handles:
+                self._last_seen.setdefault(ip, now)
+
+            missing = set(client_ips) - set(ip_handles.keys())
+            if missing:
+                self._ensure_rules(missing)
+
+            stale_ips = {
+                ip for ip in ip_handles
+                if ip not in client_ips and (now - self._last_seen.get(ip, now)) > stale_timeout
+            }
+            if stale_ips:
+                self._cleanup_stale_rules(stale_ips, ip_handles)
+
+            for ip in client_ips:
+                tx_bytes = ip_counters.get(ip, {}).get("tx_bytes", 0)
+                rx_bytes = ip_counters.get(ip, {}).get("rx_bytes", 0)
 
                 prev = self._counters_cache.get(ip, {})
-                prev_saddr = prev.get("saddr_bytes", 0)
-                prev_daddr = prev.get("daddr_bytes", 0)
+                prev_tx = prev.get("tx_bytes", 0)
+                prev_rx = prev.get("rx_bytes", 0)
                 prev_ts = prev.get("ts", now)
 
                 dt = max(now - prev_ts, 1)  # Avoid division by zero
-                tx_rate = max(0, (saddr_bytes - prev_saddr) / dt)
-                rx_rate = max(0, (daddr_bytes - prev_daddr) / dt)
+                tx_rate = max(0, (tx_bytes - prev_tx) / dt) if prev else 0
+                rx_rate = max(0, (rx_bytes - prev_rx) / dt) if prev else 0
 
-                self._counters_cache[ip] = {
-                    "saddr_bytes": saddr_bytes,
-                    "daddr_bytes": daddr_bytes,
-                    "ts": now,
-                }
+                self._counters_cache[ip] = {"tx_bytes": tx_bytes, "rx_bytes": rx_bytes, "ts": now}
 
                 results[ip] = {
-                    "rx_bytes": daddr_bytes,
-                    "tx_bytes": saddr_bytes,
+                    "rx_bytes": rx_bytes,
+                    "tx_bytes": tx_bytes,
                     "rx_rate": round(rx_rate),
                     "tx_rate": round(tx_rate),
                 }
 
         return results
 
-    def cleanup_stale_rules(self, active_ips: list, timeout_seconds: int = 600):
-        """Remove nftables rules for IPs not seen in recent activity.
-
-        Keeps rules for IPs seen within timeout_seconds, removes others.
-        """
-        with self._lock:
-            now = time.time()
-            stale_ips = [
-                ip for ip, added_ts in self._tracked_ips.items()
-                if ip not in active_ips and (now - added_ts) > timeout_seconds
-            ]
-
-            for ip in stale_ips:
-                try:
-                    # Attempting to delete rules is best-effort; nft delete requires handle
-                    # which we don't track, so this is a no-op. Rules will remain but
-                    # won't cause problems (minimal memory/cpu impact).
-                    # For now, just remove from our tracking dict.
-                    del self._tracked_ips[ip]
-                    if ip in self._counters_cache:
-                        del self._counters_cache[ip]
-                    log.debug(f"Removed tracking for stale client {ip}")
-                except Exception as exc:
-                    log.warning(f"Failed to clean up tracking for {ip}: {exc}")
-
 
 _client_bandwidth_tracker = ClientBandwidthTracker()
 
 
-def get_active_clients() -> list:
+def get_active_clients(resolve_names: bool = True) -> list:
     """Discover active clients using ARP + nftables bandwidth tracking."""
     # Get clients from ARP table
     arp_clients = get_arp_clients()
     if not arp_clients:
         return []
 
-    # Resolve hostnames; only look up IPs missing from cache or past TTL
     ips = [client["ip"] for client in arp_clients.values()]
-    now = time.time()
-    stale = [ip for ip in ips
-             if ip not in _hostname_cache
-             or now - _hostname_cache[ip][1] >= HOSTNAME_CACHE_TTL]
-    if stale:
-        fresh = get_hostnames_batch(stale, timeout=1.5, max_workers=5)
-        for ip, hostname in fresh.items():
-            _hostname_cache[ip] = (hostname, now)
+    if resolve_names:
+        # Resolve hostnames only when explicitly requested; otherwise reuse cache.
+        now = time.time()
+        stale = [ip for ip in ips
+                 if ip not in _hostname_cache
+                 or now - _hostname_cache[ip][1] >= HOSTNAME_CACHE_TTL]
+        if stale:
+            fresh = get_hostnames_batch(stale, timeout=1.5, max_workers=5)
+            for ip, hostname in fresh.items():
+                _hostname_cache[ip] = (hostname, now)
+
     hostnames = {ip: _hostname_cache.get(ip, (ip, 0))[0] for ip in ips}
 
     # Update clients with resolved hostnames.
     for client in arp_clients.values():
         client["hostname"] = hostnames.get(client["ip"], "(unknown)")
 
-    # Ensure nftables counter rules exist for these clients (best effort)
+    # Sync nftables counter rules with the active client list and read
+    # current bandwidth data (best effort).
     try:
-        lan_iface = CONF.get("LAN_IFACE", "eth1")
-        _client_bandwidth_tracker.ensure_rules(ips, lan_iface)
-
-        # Clean up stale rules for clients that haven't been seen in 10+ minutes
-        _client_bandwidth_tracker.cleanup_stale_rules(ips, timeout_seconds=600)
-
-        # Query bandwidth data for all clients
-        bandwidth_data = _client_bandwidth_tracker.get_bandwidth(ips)
+        bandwidth_data = _client_bandwidth_tracker.poll(ips, stale_timeout=600)
     except Exception as exc:
         log.error(f"Bandwidth tracking failed: {exc}")
         bandwidth_data = {}
@@ -1286,9 +1414,10 @@ def index():
 @app.route("/api/stats")
 def api_stats():
     """Master endpoint — returns all dashboard data in one call."""
+    resolve_names = request.args.get("resolve_names", "0") == "1"
     wan_ip = get_wan_ip()
     speeds = get_link_speeds()
-    clients = get_active_clients()
+    clients = get_active_clients(resolve_names=resolve_names)
     system = get_system_stats()
     pihole = get_pihole_stats()
     errors = get_recent_errors()
@@ -1320,7 +1449,7 @@ def api_stats():
 
 @app.route("/api/clients")
 def api_clients():
-    return jsonify(get_active_clients())
+    return jsonify(get_active_clients(resolve_names=True))
 
 
 @app.route("/api/pihole")

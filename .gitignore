@@ -4,6 +4,7 @@ dashboard/__pycache__/
 dashboard/*.pyc
 dashboard/router.conf
 dashboard/.env
+dashboard/port_forwards.json
 
 # Editor
 .vscode/
