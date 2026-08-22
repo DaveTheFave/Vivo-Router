@@ -892,6 +892,78 @@ main.grid {
   color: #000;
 }
 
+.psad-detail-toggle {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.psad-detail-toggle:hover {
+  border-color: var(--text);
+  color: var(--text);
+}
+
+.psad-detail-panel {
+  padding: 8px 10px 10px 22px;
+  margin: 2px 0 6px;
+  background: rgba(255,255,255,.03);
+  border-left: 3px solid var(--border);
+  border-radius: 0 4px 4px 0;
+  font-size: .74rem;
+}
+
+.psad-detail-loading {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.psad-detail-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-bottom: 6px;
+}
+
+.psad-detail-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.psad-detail-label {
+  font-size: .66rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: .3px;
+}
+
+.psad-detail-val {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.psad-detail-dest {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(48,54,61,.35);
+}
+
+.psad-detail-dest:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+.psad-detail-dest-header {
+  color: var(--text-muted);
+  margin-bottom: 3px;
+}
+
+.psad-detail-sig {
+  color: var(--orange);
+  padding: 1px 0;
+}
+
 .psad-log-icon {
   flex: 0 0 auto;
 }

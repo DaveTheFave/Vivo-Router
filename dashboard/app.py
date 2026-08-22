@@ -1610,6 +1610,113 @@ def get_psad_blocked_ips() -> list:
     return list(blocked.values())
 
 
+_IP_ADDR_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+def _summarize_whois(raw: str) -> str | None:
+    """Boil a full ARIN/RIPE-style whois dump down to one line.
+
+    Whois output cascades from the broad allocation down through each
+    reassignment to the actual registrant, as separate '# start'/'# end'
+    blocks — the last block is the most specific and most useful one.
+    """
+    blocks = re.split(r"#\s*start\s*\n", raw)
+    if not blocks:
+        return None
+    last = blocks[-1].split("# end")[0]
+
+    org = None
+    for key in ("CustName", "OrgName"):
+        m = re.search(rf"^{key}:\s*(.+)$", last, re.MULTILINE)
+        if m:
+            org = m.group(1).strip()
+            break
+
+    country_m = re.search(r"^Country:\s*(.+)$", last, re.MULTILINE)
+    city_m = re.search(r"^City:\s*(.+)$", last, re.MULTILINE)
+    country = country_m.group(1).strip() if country_m else None
+    city = city_m.group(1).strip() if city_m else None
+
+    parts = [p for p in (org, city, country) if p]
+    return " · ".join(parts) if parts else None
+
+
+def get_psad_ip_detail(ip: str) -> dict:
+    """Return psad's own detailed tracking data for one attacker IP.
+
+    Reads /var/log/psad/<ip>/ directly — the same per-attacker bookkeeping
+    'psad -S' summarizes into its "Top attackers" table (danger level,
+    packet counts per destination, matched signatures, scan start time,
+    whois). This is the authoritative "why was this IP flagged" answer,
+    richer than what fits in the journal-derived activity feed. Returns
+    tracked: false for IPs psad never scored (e.g. a manual block against
+    an address that was never actually seen scanning).
+    """
+    if not _IP_ADDR_RE.match(ip):
+        return {"ip": ip, "tracked": False}
+
+    ip_dir = Path("/var/log/psad") / ip
+    if not ip_dir.is_dir():
+        return {"ip": ip, "tracked": False}
+
+    detail: dict = {"ip": ip, "tracked": True, "destinations": []}
+
+    dl_file = ip_dir / "danger_level"
+    if dl_file.exists():
+        try:
+            detail["danger_level"] = int(dl_file.read_text(errors="replace").strip())
+        except Exception:
+            pass
+
+    whois_file = ip_dir / f"{ip}_whois"
+    if whois_file.exists():
+        try:
+            raw = whois_file.read_text(errors="replace").strip()
+            detail["whois"] = raw
+            detail["whois_summary"] = _summarize_whois(raw)
+        except Exception:
+            pass
+
+    dest_ips = set()
+    try:
+        for f in ip_dir.glob("*_packet_ctr"):
+            dest_ips.add(f.name[: -len("_packet_ctr")])
+    except Exception as exc:
+        log.debug(f"get_psad_ip_detail: glob failed for {ip}: {exc}")
+
+    for dest in sorted(dest_ips):
+        dest_info: dict = {"dest": dest}
+
+        pc = ip_dir / f"{dest}_packet_ctr"
+        if pc.exists():
+            try:
+                dest_info["packets"] = int(pc.read_text(errors="replace").strip())
+            except Exception:
+                pass
+
+        st = ip_dir / f"{dest}_start_time"
+        if st.exists():
+            try:
+                epoch = int(st.read_text(errors="replace").strip())
+                dest_info["start_time"] = datetime.fromtimestamp(
+                    epoch, tz=timezone.utc
+                ).replace(microsecond=0).isoformat()
+            except Exception:
+                pass
+
+        sig = ip_dir / f"{dest}_signatures"
+        if sig.exists():
+            try:
+                lines = [l.strip() for l in sig.read_text(errors="replace").splitlines() if l.strip()]
+                dest_info["signatures"] = lines
+            except Exception:
+                dest_info["signatures"] = []
+
+        detail["destinations"].append(dest_info)
+
+    return detail
+
+
 _PSAD_LOG_LINE_RE = re.compile(r'^(\S+)\s+\S+\s+psad\[\d+\]:\s*(.*)$')
 _PSAD_RE_BLOCK = re.compile(r'added iptables auto-block against (?P<ip>\S+) for (?P<seconds>\d+) seconds')
 _PSAD_RE_SCAN = re.compile(
@@ -1792,6 +1899,11 @@ def api_psad_unblock():
     ip = str(data.get("ip", "")).strip()
     ok, msg = psad_manual_unblock(ip)
     return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+
+
+@app.route("/api/psad/detail/<ip>")
+def api_psad_detail(ip):
+    return jsonify(get_psad_ip_detail(ip))
 
 
 @app.route("/api/pihole")

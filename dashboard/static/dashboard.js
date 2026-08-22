@@ -421,6 +421,9 @@ const PSAD_TYPE_ICON = {
 };
 
 let _psadBlockedIps = new Set();
+let _psadLastEvents = [];
+let _psadExpandedIps = new Set();   // block-type rows currently showing detail
+const _psadDetailCache = {};        // ip -> detail response (or "loading"/"error" sentinel)
 
 function renderPsad(psad) {
   const badge = document.getElementById("psad-status-badge");
@@ -436,6 +439,7 @@ function renderPsad(psad) {
 
   const events = Array.isArray(psad.events) ? psad.events : [];
   setText("psad-event-count", String(events.length));
+  _psadLastEvents = events;
 
   const blockedListEl = document.getElementById("psad-blocked-list");
   if (blockedListEl) {
@@ -445,9 +449,52 @@ function renderPsad(psad) {
     }).join("");
   }
 
+  _renderPsadLog();
+}
+
+function _renderPsadDetailPanel(ip) {
+  const cached = _psadDetailCache[ip];
+  if (cached === "loading" || cached === undefined) {
+    return '<div class="psad-detail-panel"><div class="psad-detail-loading">Loading…</div></div>';
+  }
+  if (cached === "error") {
+    return '<div class="psad-detail-panel"><div class="psad-detail-loading">Failed to load detail.</div></div>';
+  }
+  if (!cached.tracked) {
+    return '<div class="psad-detail-panel"><div class="psad-detail-loading">psad has no tracking history for this IP (blocked preemptively, not from a detected scan).</div></div>';
+  }
+
+  let html = '<div class="psad-detail-panel"><div class="psad-detail-grid">';
+  if (cached.danger_level !== undefined && cached.danger_level !== null) {
+    html += `<div class="psad-detail-item"><span class="psad-detail-label">Danger Level</span><span class="psad-detail-val">DL${escHtml(String(cached.danger_level))}</span></div>`;
+  }
+  if (cached.whois_summary) {
+    html += `<div class="psad-detail-item"><span class="psad-detail-label">Registrant</span><span class="psad-detail-val">${escHtml(cached.whois_summary)}</span></div>`;
+  }
+  html += "</div>";
+
+  const dests = Array.isArray(cached.destinations) ? cached.destinations : [];
+  for (const d of dests) {
+    const bits = [];
+    if (d.packets !== undefined) bits.push(fmtNum(d.packets) + " packets");
+    if (d.start_time) bits.push("since " + fmtTimestamp(d.start_time));
+    html += '<div class="psad-detail-dest">';
+    html += `<div class="psad-detail-dest-header">Target ${escHtml(d.dest || "")}${bits.length ? " · " + escHtml(bits.join(" · ")) : ""}</div>`;
+    if (Array.isArray(d.signatures) && d.signatures.length) {
+      html += d.signatures.map(s => `<div class="psad-detail-sig">${escHtml(s)}</div>`).join("");
+    }
+    html += "</div>";
+  }
+
+  html += "</div>";
+  return html;
+}
+
+function _renderPsadLog() {
   const logEl = document.getElementById("psad-log");
   if (!logEl) return;
 
+  const events = _psadLastEvents;
   if (events.length === 0) {
     logEl.innerHTML = '<div class="psad-log-line empty">No scan activity recorded.</div>';
     return;
@@ -458,21 +505,49 @@ function renderPsad(psad) {
     const ts = fmtTimestamp(ev.timestamp);
     const resolvedClass = ev.resolved ? " psad-resolved" : "";
     const ip = ev.ip || "";
+    const isBlockType = ev.type === "auto_block" || ev.type === "manual_block";
     const isBlocked = _psadBlockedIps.has(ip);
     const actionBtn = ip
       ? (isBlocked
           ? `<button class="psad-action-btn psad-unblock-btn" onclick="psadUnblock('${escHtml(ip)}')">Unblock</button>`
           : `<button class="psad-action-btn psad-block-btn" onclick="psadBlock('${escHtml(ip)}')">Block</button>`)
       : "";
-    return `<div class="psad-log-line psad-type-${escHtml(ev.type || "")}${resolvedClass}">` +
+    const isExpanded = isBlockType && _psadExpandedIps.has(ip);
+    const detailToggle = isBlockType
+      ? `<button class="psad-action-btn psad-detail-toggle" onclick="psadToggleDetail('${escHtml(ip)}')">${isExpanded ? "▲ Why" : "▼ Why"}</button>`
+      : "";
+    const row = `<div class="psad-log-line psad-type-${escHtml(ev.type || "")}${resolvedClass}">` +
       `<span class="psad-log-icon">${icon}</span>` +
       `<span class="psad-log-ip">${escHtml(ip)}</span>` +
       `<span class="psad-log-detail">${escHtml(ev.detail || "")}</span>` +
       `<span class="psad-log-ts">${escHtml(ts)}</span>` +
+      detailToggle +
       actionBtn +
       `</div>`;
+    const detailPanel = isExpanded ? _renderPsadDetailPanel(ip) : "";
+    return row + detailPanel;
   });
   logEl.innerHTML = lines.join("");
+}
+
+async function psadToggleDetail(ip) {
+  if (_psadExpandedIps.has(ip)) {
+    _psadExpandedIps.delete(ip);
+    _renderPsadLog();
+    return;
+  }
+  _psadExpandedIps.add(ip);
+  if (_psadDetailCache[ip] === undefined) {
+    _psadDetailCache[ip] = "loading";
+    _renderPsadLog();
+    try {
+      const resp = await fetch("/api/psad/detail/" + encodeURIComponent(ip));
+      _psadDetailCache[ip] = resp.ok ? await resp.json() : "error";
+    } catch (err) {
+      _psadDetailCache[ip] = "error";
+    }
+  }
+  _renderPsadLog();
 }
 
 async function psadBlock(ip) {
