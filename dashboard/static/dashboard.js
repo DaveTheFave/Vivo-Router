@@ -445,7 +445,10 @@ function renderPsad(psad) {
   if (blockedListEl) {
     blockedListEl.innerHTML = blocked.map(b => {
       const pkts = fmtNum(b.packets);
-      return `<span class="psad-blocked-chip" title="${escHtml(pkts)} packets dropped since block · source: ${escHtml(b.source || "?")}">🚫 ${escHtml(b.ip)}</span>`;
+      return `<span class="psad-blocked-chip" title="${escHtml(pkts)} packets dropped since block · source: ${escHtml(b.source || "?")}">` +
+        `🚫 ${escHtml(b.ip)}` +
+        `<button class="psad-chip-unblock" title="Unblock ${escHtml(b.ip)}" onclick="psadUnblock('${escHtml(b.ip)}')">×</button>` +
+        `</span>`;
     }).join("");
   }
 

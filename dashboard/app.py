@@ -1379,31 +1379,41 @@ def _parse_nft_text() -> list:
     return rules
 
 
-def get_psad_auto_blocked_ips() -> list:
+_PSAD_BLOCK_CHAINS = ("PSAD_BLOCK_INPUT", "PSAD_BLOCK_OUTPUT", "PSAD_BLOCK_FORWARD")
+
+
+def get_psad_auto_blocked_ips() -> dict:
     """Query nftables for IPs currently auto-blocked by psad.
 
     psad's iptables-nft compat layer manages a separate 'ip filter' table
     (distinct from our own 'inet filter' table) — reading that directly
     reflects live block state, rather than parsing psad's own bookkeeping
     files which may lag or include already-expired entries.
+
+    psad spreads a single block across up to three chains (INPUT matches
+    saddr, OUTPUT matches daddr, FORWARD can carry both a saddr and a daddr
+    rule for the same IP) — an earlier version of this only read
+    PSAD_BLOCK_INPUT, so "unblocking" an IP silently left it still dropped
+    by the other two. Returns {ip: {"packets", "bytes", "rules": [(chain,
+    handle), ...]}} so callers can remove every rule for an IP, not just one.
     """
     blocked: dict = {}
     try:
         result = subprocess.run(
-            ["nft", "-j", "list", "table", "ip", "filter"],
+            ["nft", "-j", "-a", "list", "table", "ip", "filter"],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0 or not result.stdout.strip():
-            return []
+            return {}
         data = json.loads(result.stdout)
     except Exception as exc:
         log.debug(f"get_psad_auto_blocked_ips: nft query failed: {exc}")
-        return []
+        return {}
 
     try:
         for item in data.get("nftables", []):
             rule = item.get("rule")
-            if not rule or rule.get("chain") != "PSAD_BLOCK_INPUT":
+            if not rule or rule.get("chain") not in _PSAD_BLOCK_CHAINS:
                 continue
             ip = None
             counter = None
@@ -1413,21 +1423,22 @@ def get_psad_auto_blocked_ips() -> list:
                 if "match" in expr:
                     left = expr["match"].get("left", {})
                     right = expr["match"].get("right")
-                    if isinstance(left, dict) and left.get("payload", {}).get("field") == "saddr":
-                        if isinstance(right, str):
+                    if isinstance(left, dict):
+                        field = left.get("payload", {}).get("field")
+                        if field in ("saddr", "daddr") and isinstance(right, str):
                             ip = right
                 if "counter" in expr:
                     counter = expr["counter"]
-            if ip:
-                blocked[ip] = {
-                    "ip": ip,
-                    "packets": (counter or {}).get("packets", 0),
-                    "bytes": (counter or {}).get("bytes", 0),
-                }
+            if not ip:
+                continue
+            entry = blocked.setdefault(ip, {"packets": 0, "bytes": 0, "rules": []})
+            entry["packets"] += (counter or {}).get("packets", 0)
+            entry["bytes"] += (counter or {}).get("bytes", 0)
+            entry["rules"].append((rule.get("chain"), rule.get("handle")))
     except Exception as exc:
         log.debug(f"get_psad_auto_blocked_ips: parse failed: {exc}")
 
-    return list(blocked.values())
+    return blocked
 
 
 # ── dashboard-managed manual blocks ──────────────────────────────────────────
@@ -1574,9 +1585,18 @@ def psad_manual_block(ip: str) -> tuple[bool, str]:
 
 
 def psad_manual_unblock(ip: str) -> tuple[bool, str]:
-    """Remove a manual block for an IP."""
+    """Remove every block on an IP — the dashboard's own manual-block set
+    entry (if any) AND every psad auto-block rule for it across all three
+    chains psad manages (if any). A single "Unblock" action has to clear
+    all of these: psad spreads one block across PSAD_BLOCK_INPUT/OUTPUT/
+    FORWARD, and clearing only one (the original bug here) leaves the IP
+    silently still dropped by the others.
+    """
     if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
         return False, "Invalid IP address"
+
+    removed_anything = False
+    errors = []
 
     _ensure_dashboard_blocks_table()
     result = subprocess.run(
@@ -1584,8 +1604,29 @@ def psad_manual_unblock(ip: str) -> tuple[bool, str]:
          "{ " + ip + " }"],
         capture_output=True, text=True, timeout=5
     )
-    if result.returncode != 0:
-        return False, result.stderr.strip() or "nft command failed"
+    stderr_lower = (result.stderr or "").lower()
+    if result.returncode == 0:
+        removed_anything = True
+    elif "does not exist" not in stderr_lower and "no such file or directory" not in stderr_lower:
+        errors.append(result.stderr.strip())
+
+    auto_blocked = get_psad_auto_blocked_ips()
+    entry = auto_blocked.get(ip)
+    if entry:
+        for chain, handle in entry["rules"]:
+            if handle is None:
+                continue
+            result = subprocess.run(
+                ["nft", "delete", "rule", "ip", "filter", chain, "handle", str(handle)],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                removed_anything = True
+            else:
+                errors.append(result.stderr.strip())
+
+    if not removed_anything:
+        return False, "IP was not found in any block list"
 
     _append_manual_event({
         "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
@@ -1593,6 +1634,8 @@ def psad_manual_unblock(ip: str) -> tuple[bool, str]:
         "ip": ip,
         "detail": "Manually unblocked from dashboard",
     })
+    if errors:
+        return True, "Unblocked, with some errors: " + "; ".join(errors)
     return True, "Unblocked"
 
 
@@ -1600,8 +1643,13 @@ def get_psad_blocked_ips() -> list:
     """Return all currently-blocked IPs, from both psad's own auto-blocks
     and the dashboard's manual-block set, tagged with their source."""
     blocked = {}
-    for entry in get_psad_auto_blocked_ips():
-        blocked[entry["ip"]] = {**entry, "source": "psad"}
+    for ip, entry in get_psad_auto_blocked_ips().items():
+        blocked[ip] = {
+            "ip": ip,
+            "packets": entry["packets"],
+            "bytes": entry["bytes"],
+            "source": "psad",
+        }
     for ip in get_manual_blocked_ips():
         if ip in blocked:
             blocked[ip]["source"] = "psad+manual"

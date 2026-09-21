@@ -798,9 +798,28 @@ main.grid {
   border: 1px solid var(--red);
   color: var(--red);
   border-radius: 20px;
-  padding: 3px 10px;
+  padding: 3px 6px 3px 10px;
   font-size: .76rem;
   font-family: var(--font-mono);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.psad-chip-unblock {
+  background: transparent;
+  border: none;
+  color: var(--red);
+  font-size: .9rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+  border-radius: 50%;
+}
+
+.psad-chip-unblock:hover {
+  background: var(--red);
+  color: #fff;
 }
 
 .psad-section-label {
