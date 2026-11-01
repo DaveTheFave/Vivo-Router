@@ -90,6 +90,7 @@ async function fetchStats(resolveNames = false) {
   renderHealth(data);
   renderGatewayTimeout(data.gateway_timeout || {});
   renderPsad(data.psad || {});
+  renderSuricata(data.suricata || {});
   renderErrors(data.recent_errors || []);
   setText("last-updated", "Last updated: " + new Date().toLocaleTimeString());
 }
@@ -551,6 +552,35 @@ async function psadToggleDetail(ip) {
     }
   }
   _renderPsadLog();
+}
+
+function renderSuricata(suricata) {
+  const badge = document.getElementById("suricata-status-badge");
+  const enabled = Boolean(suricata.enabled);
+  if (badge) {
+    badge.className = "suricata-status-badge " + (enabled ? "active" : "disabled");
+    badge.textContent = enabled ? "Active" : "Disabled";
+  }
+
+  setText("suricata-alert-count", String(suricata.alert_count || 0));
+
+  const logEl = document.getElementById("suricata-log");
+  if (!logEl) return;
+  const alerts = Array.isArray(suricata.alerts) ? suricata.alerts : [];
+  if (!alerts.length) {
+    logEl.innerHTML = '<div class="suricata-log-line empty">No alerts recorded.</div>';
+    return;
+  }
+
+  logEl.innerHTML = alerts.map(a => {
+    const sev = (a.severity === undefined || a.severity === null) ? 3 : a.severity;
+    const dest = a.dest_ip ? (a.dest_ip + (a.dest_port ? ":" + a.dest_port : "")) : "";
+    return `<div class="suricata-log-line suricata-sev-${escHtml(String(sev))}">` +
+      `<span class="suricata-log-sig">${escHtml(a.signature || "")}</span>` +
+      `<span class="suricata-log-flow">${escHtml(a.src_ip || "")} → ${escHtml(dest)}</span>` +
+      `<span class="suricata-log-ts">${escHtml(fmtTimestamp(a.timestamp))}</span>` +
+      `</div>`;
+  }).join("");
 }
 
 async function psadBlock(ip) {

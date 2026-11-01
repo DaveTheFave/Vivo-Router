@@ -1878,6 +1878,60 @@ def get_recent_errors(n: int = 20) -> list:
     return errors[:n]
 
 
+SURICATA_EVE_LOG = Path("/var/log/suricata/eve.json")
+
+
+def get_suricata_activity(n: int = 25) -> dict:
+    """Return Suricata's IDS status and its most recent alert events.
+
+    Suricata logs every event (flow, dns, tls, alert, ...) as one JSON
+    object per line to eve.json. Only "alert" events matter here, so we
+    read just the tail of the file — cheap even as it grows between
+    logrotate rotations, rather than parsing the whole thing.
+    """
+    active = _run(["systemctl", "is-active", "suricata"]) == "active"
+
+    alerts = []
+    if SURICATA_EVE_LOG.exists():
+        try:
+            with SURICATA_EVE_LOG.open(errors="replace") as f:
+                tail = deque(f, maxlen=3000)
+        except Exception as exc:
+            log.debug(f"get_suricata_activity: read failed: {exc}")
+            tail = []
+
+        for line in tail:
+            try:
+                evt = json.loads(line)
+            except Exception:
+                continue
+            if evt.get("event_type") != "alert":
+                continue
+            a = evt.get("alert") or {}
+            alerts.append({
+                "timestamp": evt.get("timestamp", ""),
+                "iface": evt.get("in_iface"),
+                "src_ip": evt.get("src_ip"),
+                "src_port": evt.get("src_port"),
+                "dest_ip": evt.get("dest_ip"),
+                "dest_port": evt.get("dest_port"),
+                "proto": evt.get("proto"),
+                "signature": a.get("signature", ""),
+                "severity": a.get("severity"),
+                "category": a.get("category", ""),
+            })
+
+    alerts.sort(key=lambda e: e["timestamp"])
+    alerts = alerts[-n:]
+    alerts.reverse()
+
+    return {
+        "enabled": active,
+        "alert_count": len(alerts),
+        "alerts": alerts,
+    }
+
+
 # ── routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -1898,6 +1952,7 @@ def api_stats():
     health = get_health_checks()
     gateway_timeout = gateway_timeout_tracker.update(health.get("gateway", {}))
     psad = get_psad_activity()
+    suricata = get_suricata_activity()
 
     wan_iface = CONF["WAN_IFACE"]
     lan_iface = CONF["LAN_IFACE"]
@@ -1920,6 +1975,7 @@ def api_stats():
         "health": health,
         "gateway_timeout": gateway_timeout,
         "psad": psad,
+        "suricata": suricata,
     })
 
 
@@ -1952,6 +2008,11 @@ def api_psad_unblock():
 @app.route("/api/psad/detail/<ip>")
 def api_psad_detail(ip):
     return jsonify(get_psad_ip_detail(ip))
+
+
+@app.route("/api/suricata")
+def api_suricata():
+    return jsonify(get_suricata_activity())
 
 
 @app.route("/api/pihole")
