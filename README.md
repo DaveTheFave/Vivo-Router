@@ -21,6 +21,8 @@ Turn an Ubuntu server (e.g., a laptop) into a fully-featured router / gateway, c
 | **Pi-hole stats** | Domains blocked, queries today, block %, unique clients |
 | **System health** | CPU %, RAM %, Disk %, CPU temp, uptime |
 | **Error log** | Recent dnsmasq and syslog errors shown in the dashboard |
+| **Suricata IDS** | Passive network intrusion detection (ET Open ruleset) on WAN + LAN, alerts surfaced on the dashboard |
+| **UPnP / NAT-PMP** | Automatic port forwarding via `miniupnpd`, with a dashboard widget showing active mappings, the requesting device, and a best-guess reason |
 | **Kiosk mode** | Chromium opens the dashboard fullscreen on boot |
 | **Systemd services** | Dashboard and kiosk run as managed systemd units |
 
@@ -99,6 +101,8 @@ The dashboard auto-refreshes every **5 seconds** and shows:
 - ⚙ **System resources** — CPU, RAM, Disk progress bars + CPU temperature
 - ⏱ **Uptime** — server uptime
 - ⚠ **Error log** — last 20 lines from dnsmasq/syslog matching error patterns
+- 🔎 **Suricata IDS** — recent alerts with severity, source/destination, and signature
+- 🔌 **UPnP** — active port mappings, the requesting device, and a best-guess reason the port was opened
 
 ### Running manually (development)
 
@@ -159,6 +163,7 @@ sudo journalctl -fu    dnsmasq
 Vivo-Router/
 ├── setup.sh                         # Interactive router setup wizard
 ├── manage-portfwd.sh                # Port forwarding manager (add/remove/list rules)
+├── manage-upnp-nft.sh               # miniupnpd nftables bootstrap (see UPnP section below)
 ├── dashboard/
 │   ├── app.py                       # Flask backend / REST API
 │   ├── requirements.txt             # Python dependencies (flask, psutil)
@@ -169,8 +174,9 @@ Vivo-Router/
 │       ├── style.css                # Dark NOC-style theme
 │       └── dashboard.js             # Live-update polling logic
 └── services/
-    ├── vivo-router-dashboard.service  # systemd unit — Flask app
-    └── vivo-router-kiosk.service      # systemd unit — Chromium kiosk
+    ├── vivo-router-dashboard.service    # systemd unit — Flask app
+    ├── vivo-router-kiosk.service        # systemd unit — Chromium kiosk
+    └── miniupnpd-nft-bootstrap.conf     # systemd drop-in — see UPnP section below
 ```
 
 ---
@@ -219,6 +225,62 @@ Restores all saved port forwarding rules from `/etc/nftables.d/10-portfwd.conf`.
 
 ---
 
+## Suricata IDS
+
+Suricata runs in passive IDS mode — a non-inline AF_PACKET tap on both the WAN
+(`enx.201`) and LAN interfaces, so it can never affect live traffic even if
+misconfigured or crashed. It uses the Emerging Threats Open ruleset, kept
+current with `suricata-update`.
+
+```bash
+sudo systemctl status  suricata
+sudo journalctl -fu     suricata
+
+# Live alerts only, filtered from the firehose of flow/DNS/TLS events
+tail -f /var/log/suricata/eve.json | jq -c 'select(.event_type=="alert")'
+```
+
+To quiet a noisy signature without losing the rest of the ruleset, add its
+SID to `/etc/suricata/disable.conf`, then `sudo suricata-update && sudo
+systemctl restart suricata`.
+
+Recent alerts are also surfaced on the dashboard's Suricata panel.
+
+---
+
+## UPnP Port Forwarding
+
+`miniupnpd` handles dynamic port forwarding requests (UPnP IGD, NAT-PMP,
+PCP) from LAN clients — games, torrent clients, VoIP apps, etc. — so they
+don't need a manual entry in `manage-portfwd.sh`.
+
+**Known issue, fixed:** the `miniupnpd-nftables` package's own init script
+only checks whether `table inet filter` exists before deciding whether to
+create the chains it needs. Since this repo's `setup.sh` already owns that
+table, the vendor script always found it "already there" and skipped
+creating miniupnpd's chains entirely — so port mapping requests succeeded
+over SOAP but silently never took effect in nftables.
+
+`manage-upnp-nft.sh` creates the missing structure (purely additive — a new
+`inet nat` table plus one jump rule into the existing `forward` chain) and
+is wired in as an `ExecStartPre` via the systemd drop-in in
+`services/miniupnpd-nft-bootstrap.conf` (deployed to
+`/etc/systemd/system/miniupnpd.service.d/`), so it self-heals on every
+miniupnpd start. The deployed copy of the script lives at
+`/etc/miniupnpd/vivo-nft-bootstrap.sh` rather than this repo's checkout
+path — `miniupnpd.service` runs with `ProtectHome=yes`, which hides `/home`
+from it entirely.
+
+Active mappings, the requesting device, and a best-guess reason for each
+port are shown on the dashboard's UPnP panel.
+
+```bash
+sudo systemctl status miniupnpd
+cat /var/log/miniupnpd.leases   # current mappings, mirrors live state
+```
+
+---
+
 ## API Endpoints
 
 | Endpoint | Description |
@@ -229,6 +291,8 @@ Restores all saved port forwarding rules from `/etc/nftables.d/10-portfwd.conf`.
 | `GET /api/speeds` | Per-interface TX/RX rates |
 | `GET /api/system` | CPU, RAM, Disk, Temp, Uptime |
 | `GET /api/pihole` | Pi-hole summary stats |
+| `GET /api/suricata` | Recent Suricata IDS alerts |
+| `GET /api/upnp` | Active UPnP/NAT-PMP port mappings |
 
 ---
 
