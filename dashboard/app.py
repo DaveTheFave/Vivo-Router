@@ -1878,6 +1878,135 @@ def get_recent_errors(n: int = 20) -> list:
     return errors[:n]
 
 
+UPNP_LEASE_FILE = Path("/var/log/miniupnpd.leases")
+
+# Well-known ports/ranges for guessing why a UPnP mapping was opened.
+# Checked only after the client's own self-reported description and its
+# DHCP/mDNS hostname — those are more reliable when present.
+_UPNP_PORT_HINTS = [
+    ({25565}, "Minecraft (Java)"),
+    ({19132, 19133}, "Minecraft (Bedrock)"),
+    ({3074}, "Xbox Live multiplayer"),
+    ({3544}, "Xbox Live (Teredo/NAT traversal)"),
+    ({3478, 3479, 3480}, "PlayStation Network (voice/matchmaking)"),
+    (range(9293, 9296), "Nintendo Switch online play"),
+    (range(27015, 27031), "Steam / Source engine game server"),
+    (range(6881, 6890), "BitTorrent"),
+    ({51413}, "Transmission (BitTorrent)"),
+    ({4662, 4672}, "eMule"),
+    ({1935}, "RTMP streaming"),
+    ({554}, "RTSP (camera/streaming)"),
+    ({32400}, "Plex Media Server"),
+    ({8096, 8920}, "Jellyfin/Emby media server"),
+    ({2869, 5357}, "Windows device discovery (WSD/UPnP host)"),
+    ({500, 4500}, "IPSec VPN"),
+    ({1194}, "OpenVPN"),
+    ({51820}, "WireGuard VPN"),
+    ({1723}, "PPTP VPN"),
+    ({5060, 5061}, "SIP/VoIP"),
+    ({80, 443, 8080, 8443}, "Web server"),
+    ({21, 990}, "FTP/FTPS server"),
+]
+
+# Substrings matched against "<description> <hostname>" (lowercased).
+_UPNP_TEXT_HINTS = [
+    ("xbox", "Xbox"),
+    ("playstation", "PlayStation"),
+    ("ps5", "PlayStation 5"),
+    ("ps4", "PlayStation 4"),
+    ("nintendo", "Nintendo Switch"),
+    ("switch", "Nintendo Switch"),
+    ("steam", "Steam"),
+    ("utorrent", "uTorrent"),
+    ("qbittorrent", "qBittorrent"),
+    ("deluge", "Deluge (BitTorrent)"),
+    ("transmission", "Transmission (BitTorrent)"),
+    ("skype", "Skype"),
+    ("discord", "Discord"),
+    ("plex", "Plex"),
+    ("wsdapi", "Windows device discovery"),
+]
+
+
+def _classify_upnp_mapping(ext_port, description: str, hostname: str) -> str:
+    """Best-effort guess at why a UPnP mapping was likely requested."""
+    text = f"{description} {hostname}".lower()
+    for needle, label in _UPNP_TEXT_HINTS:
+        if needle in text:
+            return label
+
+    try:
+        port = int(ext_port)
+    except (TypeError, ValueError):
+        port = None
+    if port is not None:
+        for ports, label in _UPNP_PORT_HINTS:
+            if port in ports:
+                return label
+
+    return "Unknown — no recognized app, device, or port pattern"
+
+
+def get_upnp_activity(clients: list | None = None) -> dict:
+    """Return currently active UPnP/NAT-PMP/PCP port mappings.
+
+    Reads miniupnpd's lease file directly — each line mirrors a live
+    mapping (rewritten as mappings come and go, not an append-only log)
+    — and enriches it with the requesting device's DHCP/mDNS hostname
+    and a best-effort guess at why the port was opened.
+    """
+    active = _run(["systemctl", "is-active", "miniupnpd"]) == "active"
+
+    if clients is None:
+        clients = get_active_clients(resolve_names=True)
+    hostnames = {c["ip"]: c.get("hostname", "") for c in clients}
+
+    mappings = []
+    if UPNP_LEASE_FILE.exists():
+        try:
+            lines = UPNP_LEASE_FILE.read_text(errors="replace").splitlines()
+        except Exception as exc:
+            log.debug(f"get_upnp_activity: read failed: {exc}")
+            lines = []
+
+        now = time.time()
+        for line in lines:
+            parts = line.strip().split(":")
+            if len(parts) < 5:
+                continue
+            proto, ext_port, int_ip, int_port, expiry = parts[:5]
+            description = ":".join(parts[5:]) if len(parts) > 5 else ""
+            try:
+                expiry_ts = int(expiry)
+            except ValueError:
+                continue
+            if expiry_ts and expiry_ts < now:
+                continue  # stale line miniupnpd hasn't pruned yet
+
+            hostname = hostnames.get(int_ip, "")
+            mappings.append({
+                "proto": proto,
+                "ext_port": ext_port,
+                "int_ip": int_ip,
+                "int_port": int_port,
+                "hostname": hostname or int_ip,
+                "description": description,
+                "expires": (
+                    datetime.fromtimestamp(expiry_ts, tz=timezone.utc).isoformat()
+                    if expiry_ts else None
+                ),
+                "likely_reason": _classify_upnp_mapping(ext_port, description, hostname),
+            })
+
+    mappings.sort(key=lambda m: (m["int_ip"], int(m["ext_port"])))
+
+    return {
+        "enabled": active,
+        "mapping_count": len(mappings),
+        "mappings": mappings,
+    }
+
+
 SURICATA_EVE_LOG = Path("/var/log/suricata/eve.json")
 
 
@@ -1953,6 +2082,7 @@ def api_stats():
     gateway_timeout = gateway_timeout_tracker.update(health.get("gateway", {}))
     psad = get_psad_activity()
     suricata = get_suricata_activity()
+    upnp = get_upnp_activity(clients)
 
     wan_iface = CONF["WAN_IFACE"]
     lan_iface = CONF["LAN_IFACE"]
@@ -1976,6 +2106,7 @@ def api_stats():
         "gateway_timeout": gateway_timeout,
         "psad": psad,
         "suricata": suricata,
+        "upnp": upnp,
     })
 
 
@@ -2013,6 +2144,11 @@ def api_psad_detail(ip):
 @app.route("/api/suricata")
 def api_suricata():
     return jsonify(get_suricata_activity())
+
+
+@app.route("/api/upnp")
+def api_upnp():
+    return jsonify(get_upnp_activity())
 
 
 @app.route("/api/pihole")

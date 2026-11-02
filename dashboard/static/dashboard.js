@@ -90,6 +90,7 @@ async function fetchStats(resolveNames = false) {
   renderHealth(data);
   renderGatewayTimeout(data.gateway_timeout || {});
   renderPsad(data.psad || {});
+  renderUpnp(data.upnp || {});
   renderSuricata(data.suricata || {});
   renderErrors(data.recent_errors || []);
   setText("last-updated", "Last updated: " + new Date().toLocaleTimeString());
@@ -580,6 +581,36 @@ function renderSuricata(suricata) {
       `<span class="suricata-log-flow">${escHtml(a.src_ip || "")} → ${escHtml(dest)}</span>` +
       `<span class="suricata-log-ts">${escHtml(fmtTimestamp(a.timestamp))}</span>` +
       `</div>`;
+  }).join("");
+}
+
+function renderUpnp(upnp) {
+  const badge = document.getElementById("upnp-status-badge");
+  const enabled = Boolean(upnp.enabled);
+  if (badge) {
+    badge.className = "upnp-status-badge " + (enabled ? "active" : "disabled");
+    badge.textContent = enabled ? "Active" : "Disabled";
+  }
+
+  const bodyEl = document.getElementById("upnp-table-body");
+  if (!bodyEl) return;
+  const mappings = Array.isArray(upnp.mappings) ? upnp.mappings : [];
+  if (!mappings.length) {
+    bodyEl.innerHTML = '<tr><td colspan="5" class="upnp-empty">No active port mappings.</td></tr>';
+    return;
+  }
+
+  bodyEl.innerHTML = mappings.map(m => {
+    const portCell = m.ext_port === m.int_port
+      ? escHtml(String(m.ext_port))
+      : `${escHtml(String(m.ext_port))} → ${escHtml(String(m.int_port))}`;
+    return "<tr>" +
+      `<td class="upnp-port">${portCell}</td>` +
+      `<td>${escHtml(m.proto || "")}</td>` +
+      `<td>${escHtml(m.hostname || m.int_ip || "")}</td>` +
+      `<td>${escHtml(m.likely_reason || "")}</td>` +
+      `<td class="upnp-expires">${escHtml(fmtTimestamp(m.expires))}</td>` +
+      "</tr>";
   }).join("");
 }
 

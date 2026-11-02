@@ -376,6 +376,30 @@
       </div>
     </div>
 
+    <!-- UPnP port mappings panel -->
+    <div class="panel" id="upnp-panel">
+      <div class="panel-header">
+        <span class="panel-title">🔌 UPnP — Open Port Mappings</span>
+        <span class="upnp-status-badge" id="upnp-status-badge">–</span>
+      </div>
+      <div class="upnp-table-wrap">
+        <table class="upnp-table">
+          <thead>
+            <tr>
+              <th>Port</th>
+              <th>Proto</th>
+              <th>Device</th>
+              <th>Likely Reason</th>
+              <th>Expires</th>
+            </tr>
+          </thead>
+          <tbody id="upnp-table-body">
+            <tr><td colspan="5" class="upnp-empty">No active port mappings.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- Suricata IDS panel -->
     <div class="panel" id="suricata-panel">
       <div class="panel-header">
