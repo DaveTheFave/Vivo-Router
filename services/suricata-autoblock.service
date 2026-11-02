@@ -1,0 +1,8 @@
+[Unit]
+Description=Suricata auto-block — block reputation-flagged IPs hitting exposed services
+After=suricata.service nftables.service
+Wants=suricata.service nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/dave/Vivo-Router/suricata-autoblock.py

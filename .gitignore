@@ -2,6 +2,8 @@
 dashboard/.venv/
 dashboard/__pycache__/
 dashboard/*.pyc
+__pycache__/
+*.pyc
 dashboard/router.conf
 dashboard/.env
 dashboard/port_forwards.json
