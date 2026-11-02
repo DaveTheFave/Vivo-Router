@@ -11,8 +11,11 @@
 #    5. Optionally installs Pi-hole and wires it to dnsmasq
 #    6. Installs Suricata as a passive IDS on the WAN + LAN interfaces,
 #       with the reputation-hit auto-block timer
-#    7. Deploys the Vivo-Router GUI dashboard as a systemd service
-#    8. Optionally opens the dashboard in a fullscreen kiosk browser on boot
+#    7. Installs psad (scan detection), fail2ban (sshd brute-force jail),
+#       and miniupnpd (UPnP/PCP/NAT-PMP port mapping) — ufw is installed
+#       for its CLI only and left disabled, since nftables is the firewall
+#    8. Deploys the Vivo-Router GUI dashboard as a systemd service
+#    9. Optionally opens the dashboard in a fullscreen kiosk browser on boot
 #
 #  Requirements: Ubuntu 22.04+, run as root, internet access.
 # =============================================================================
@@ -166,6 +169,8 @@ PKGS=(
     lm-sensors
     jq
     suricata suricata-update
+    psad fail2ban ufw
+    miniupnpd miniupnpd-nftables
 )
 
 # Chromium for kiosk (installed separately to avoid pulling a GUI stack)
@@ -292,6 +297,10 @@ table inet filter {
 
         # SSH from LAN only
         tcp dport 22 iifname "${LAN_IFACE}" accept
+
+        # Log dropped packets with a prefix containing "DROP" so psad's
+        # default FW_MSG_SEARCH picks them up for scan detection.
+        log prefix "PSAD_DROP_INPUT: " flags all
     }
 
     chain forward {
@@ -316,6 +325,10 @@ table inet filter {
         # Port forward targets - allow forwarded traffic to reach LAN hosts
         ip daddr 192.168.1.54 tcp dport { 2323, 8920 } accept
         ip daddr 192.168.1.88 tcp dport 2222 accept
+
+        # Log dropped packets with a prefix containing "DROP" so psad's
+        # default FW_MSG_SEARCH picks them up for scan detection.
+        log prefix "PSAD_DROP_FORWARD: " flags all
     }
 
     chain output {
@@ -527,10 +540,78 @@ systemctl enable --now suricata-autoblock.timer >/dev/null 2>&1 \
     || warn "Failed to enable suricata-autoblock.timer; check 'journalctl -u suricata-autoblock'."
 success "Suricata auto-block timer enabled."
 
-# ── step 10 – dashboard ───────────────────────────────────────────────────────
+# ── step 10 – security stack (psad, fail2ban, ufw, miniupnpd) ────────────────
 echo ""
 hr
-echo -e "${BOLD}STEP 10 — Vivo-Router Dashboard${NC}"
+echo -e "${BOLD}STEP 10 — Security Stack${NC}"
+hr
+echo ""
+
+info "Enabling fail2ban (ships with its sshd jail enabled by default)…"
+systemctl enable fail2ban >/dev/null 2>&1 || true
+systemctl restart fail2ban || warn "fail2ban failed to start; check 'journalctl -u fail2ban'."
+success "fail2ban configured."
+
+info "Enabling psad (scan detection on the nftables DROP-prefixed log lines above)…"
+systemctl enable psad >/dev/null 2>&1 || true
+systemctl restart psad || warn "psad failed to start; check 'journalctl -u psad'."
+success "psad configured."
+
+warn "ufw installed for its CLI/status files only — left disabled. nftables" \
+     "(configured in Step 5) is this router's actual firewall; 'ufw enable'" \
+     "would install its own competing ruleset."
+
+info "Configuring miniupnpd for UPnP/PCP/NAT-PMP port mapping on ${LAN_IFACE}…"
+
+MINIUPNPD_CONF="/etc/miniupnpd/miniupnpd.conf"
+if [[ -f "$MINIUPNPD_CONF" ]]; then
+    cat > "$MINIUPNPD_CONF" <<EOF
+enable_upnp=yes
+enable_pcp_pmp=yes
+ext_ifname=${ACTUAL_WAN_IFACE}
+listening_ip=${LAN_IFACE}/${PREFIX}
+upnp_table_name=filter
+upnp_nat_table_name=nat
+lease_file=/var/log/miniupnpd.leases
+clean_ruleset_threshold=10
+clean_ruleset_interval=600
+system_uptime=yes
+notify_interval=30
+secure_mode=yes
+min_lifetime=120
+max_lifetime=86400
+uuid=$(cat /proc/sys/kernel/random/uuid)
+allow 1024-65535 ${LAN_SUBNET} 1024-65535
+deny 0-65535 0.0.0.0/0 0-65535
+EOF
+else
+    warn "${MINIUPNPD_CONF} not found; skipping miniupnpd configuration."
+fi
+
+# miniupnpd-nftables' own init script only creates the chains it needs if
+# "table inet filter" doesn't already exist — since Step 5 already owns
+# that table, the vendor script always finds it "already there" and skips
+# creating miniupnpd's chains. manage-upnp-nft.sh adds the missing
+# structure (purely additive); it's deployed outside /home because
+# miniupnpd.service runs with ProtectHome=yes. See README.md for detail.
+info "Deploying miniupnpd nftables bootstrap fix…"
+mkdir -p /etc/miniupnpd
+cp "${SCRIPT_DIR}/manage-upnp-nft.sh" /etc/miniupnpd/vivo-nft-bootstrap.sh
+chmod 755 /etc/miniupnpd/vivo-nft-bootstrap.sh
+
+mkdir -p /etc/systemd/system/miniupnpd.service.d
+cp "${SCRIPT_DIR}/services/miniupnpd-nft-bootstrap.conf" \
+   /etc/systemd/system/miniupnpd.service.d/override.conf
+
+systemctl daemon-reload
+systemctl enable miniupnpd >/dev/null 2>&1 || true
+systemctl restart miniupnpd || warn "miniupnpd failed to start; check 'journalctl -u miniupnpd'."
+success "miniupnpd configured."
+
+# ── step 11 – dashboard ───────────────────────────────────────────────────────
+echo ""
+hr
+echo -e "${BOLD}STEP 11 — Vivo-Router Dashboard${NC}"
 hr
 echo ""
 
@@ -580,11 +661,11 @@ systemctl enable vivo-router-dashboard >/dev/null 2>&1
 systemctl restart vivo-router-dashboard || warn "Dashboard service failed to start; check 'journalctl -u vivo-router-dashboard'."
 success "Dashboard service started on http://${LAN_IP}:5000"
 
-# ── step 11 – kiosk mode ──────────────────────────────────────────────────────
+# ── step 12 – kiosk mode ──────────────────────────────────────────────────────
 if $KIOSK_MODE; then
     echo ""
     hr
-    echo -e "${BOLD}STEP 11 — Kiosk Mode${NC}"
+    echo -e "${BOLD}STEP 12 — Kiosk Mode${NC}"
     hr
     echo ""
 
