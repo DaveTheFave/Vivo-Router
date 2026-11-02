@@ -9,8 +9,10 @@
 #    3. Configures IP forwarding and NAT masquerading
 #    4. Sets up dnsmasq for DHCP and local DNS
 #    5. Optionally installs Pi-hole and wires it to dnsmasq
-#    6. Deploys the Vivo-Router GUI dashboard as a systemd service
-#    7. Optionally opens the dashboard in a fullscreen kiosk browser on boot
+#    6. Installs Suricata as a passive IDS on the WAN + LAN interfaces,
+#       with the reputation-hit auto-block timer
+#    7. Deploys the Vivo-Router GUI dashboard as a systemd service
+#    8. Optionally opens the dashboard in a fullscreen kiosk browser on boot
 #
 #  Requirements: Ubuntu 22.04+, run as root, internet access.
 # =============================================================================
@@ -163,6 +165,7 @@ PKGS=(
     vnstat
     lm-sensors
     jq
+    suricata suricata-update
 )
 
 # Chromium for kiosk (installed separately to avoid pulling a GUI stack)
@@ -452,10 +455,82 @@ systemctl enable vnstat >/dev/null 2>&1 || true
 systemctl restart vnstat || warn "vnstat failed to start."
 success "vnstat configured."
 
-# ── step 9 – dashboard ────────────────────────────────────────────────────────
+# ── step 9 – Suricata IDS ─────────────────────────────────────────────────────
 echo ""
 hr
-echo -e "${BOLD}STEP 9 — Vivo-Router Dashboard${NC}"
+echo -e "${BOLD}STEP 9 — Suricata IDS${NC}"
+hr
+echo ""
+
+SURICATA_YAML="/etc/suricata/suricata.yaml"
+
+if [[ -f "$SURICATA_YAML" ]]; then
+    info "Setting HOME_NET and tapping ${ACTUAL_WAN_IFACE} + ${LAN_IFACE} (passive AF_PACKET)…"
+
+    # HOME_NET is the only active (non-commented) line of that name.
+    sed -i "s/^\([[:space:]]*\)HOME_NET: .*/\1HOME_NET: \"[${LAN_SUBNET}]\"/" "$SURICATA_YAML"
+
+    # Point the default af-packet entry at the WAN interface, and add a
+    # second entry for the LAN interface (mirrors the two-tap setup
+    # documented in the README) if one isn't already there.
+    if ! grep -q "interface: ${LAN_IFACE}" "$SURICATA_YAML"; then
+        python3 - "$SURICATA_YAML" "$ACTUAL_WAN_IFACE" "$LAN_IFACE" <<'PYEOF'
+import sys
+
+path, wan_iface, lan_iface = sys.argv[1:4]
+lines = open(path).readlines()
+
+out = []
+in_af_packet = False
+replaced_first_iface = False
+inserted_lan_entry = False
+for line in lines:
+    if line.rstrip("\n") == "af-packet:":
+        in_af_packet = True
+        out.append(line)
+        continue
+    if in_af_packet and not replaced_first_iface and line.lstrip().startswith("- interface:"):
+        indent = line[: len(line) - len(line.lstrip())]
+        out.append(f"{indent}- interface: {wan_iface}\n")
+        replaced_first_iface = True
+        continue
+    if (in_af_packet and not inserted_lan_entry
+            and line.strip() == "- interface: default"):
+        out.append(f"  - interface: {lan_iface}\n")
+        out.append("    cluster-id: 98\n")
+        out.append("    cluster-type: cluster_flow\n")
+        out.append("    defrag: yes\n\n")
+        inserted_lan_entry = True
+    if in_af_packet and line.lstrip().startswith("af-xdp:"):
+        in_af_packet = False
+    out.append(line)
+
+open(path, "w").writelines(out)
+PYEOF
+    fi
+else
+    warn "${SURICATA_YAML} not found; skipping HOME_NET/interface configuration."
+fi
+
+info "Fetching Suricata ruleset (ET Open)…"
+suricata-update >/dev/null 2>&1 || warn "suricata-update failed; rules may be stale — run it manually later."
+
+systemctl enable suricata >/dev/null 2>&1 || true
+systemctl restart suricata || warn "Suricata failed to start; check 'journalctl -u suricata'."
+success "Suricata IDS configured."
+
+info "Installing Suricata auto-block timer…"
+cp "${SCRIPT_DIR}/services/suricata-autoblock.service" /etc/systemd/system/
+cp "${SCRIPT_DIR}/services/suricata-autoblock.timer" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now suricata-autoblock.timer >/dev/null 2>&1 \
+    || warn "Failed to enable suricata-autoblock.timer; check 'journalctl -u suricata-autoblock'."
+success "Suricata auto-block timer enabled."
+
+# ── step 10 – dashboard ───────────────────────────────────────────────────────
+echo ""
+hr
+echo -e "${BOLD}STEP 10 — Vivo-Router Dashboard${NC}"
 hr
 echo ""
 
@@ -505,11 +580,11 @@ systemctl enable vivo-router-dashboard >/dev/null 2>&1
 systemctl restart vivo-router-dashboard || warn "Dashboard service failed to start; check 'journalctl -u vivo-router-dashboard'."
 success "Dashboard service started on http://${LAN_IP}:5000"
 
-# ── step 10 – kiosk mode ──────────────────────────────────────────────────────
+# ── step 11 – kiosk mode ──────────────────────────────────────────────────────
 if $KIOSK_MODE; then
     echo ""
     hr
-    echo -e "${BOLD}STEP 10 — Kiosk Mode${NC}"
+    echo -e "${BOLD}STEP 11 — Kiosk Mode${NC}"
     hr
     echo ""
 
