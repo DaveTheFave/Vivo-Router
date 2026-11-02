@@ -436,24 +436,15 @@ function renderPsad(psad) {
     badge.textContent = enabled ? "Active" : "Disabled";
   }
 
+  // Not shown directly any more (see the Blocklist panel), but still
+  // tracked so the event log below knows not to offer "Block" on an IP
+  // that's already blocked.
   const blocked = Array.isArray(psad.currently_blocked) ? psad.currently_blocked : [];
-  setText("psad-blocked-count", String(blocked.length));
   _psadBlockedIps = new Set(blocked.map(b => b.ip));
 
   const events = Array.isArray(psad.events) ? psad.events : [];
   setText("psad-event-count", String(events.length));
   _psadLastEvents = events;
-
-  const blockedListEl = document.getElementById("psad-blocked-list");
-  if (blockedListEl) {
-    blockedListEl.innerHTML = blocked.map(b => {
-      const pkts = fmtNum(b.packets);
-      return `<span class="psad-blocked-chip" title="${escHtml(pkts)} packets dropped since block · source: ${escHtml(b.source || "?")}">` +
-        `🚫 ${escHtml(b.ip)}` +
-        `<button class="psad-chip-unblock" title="Unblock ${escHtml(b.ip)}" onclick="psadUnblock('${escHtml(b.ip)}')">×</button>` +
-        `</span>`;
-    }).join("");
-  }
 
   _renderPsadLog();
 }
@@ -513,10 +504,9 @@ function _renderPsadLog() {
     const ip = ev.ip || "";
     const isBlockType = ev.type === "auto_block" || ev.type === "manual_block";
     const isBlocked = _psadBlockedIps.has(ip);
-    const actionBtn = ip
-      ? (isBlocked
-          ? `<button class="psad-action-btn psad-unblock-btn" onclick="psadUnblock('${escHtml(ip)}')">Unblock</button>`
-          : `<button class="psad-action-btn psad-block-btn" onclick="psadBlock('${escHtml(ip)}')">Block</button>`)
+    // Already-blocked IPs are unblocked from the Blocklist panel now, not here.
+    const actionBtn = (ip && !isBlocked)
+      ? `<button class="psad-action-btn psad-block-btn" onclick="blockIp('${escHtml(ip)}')">Block</button>`
       : "";
     const isExpanded = isBlockType && _psadExpandedIps.has(ip);
     const detailToggle = isBlockType
@@ -630,7 +620,7 @@ function renderBlocklist(blocklist) {
   if (!bodyEl) return;
 
   if (!entries.length) {
-    bodyEl.innerHTML = '<tr><td colspan="3" class="blocklist-empty">No IPs currently blocked.</td></tr>';
+    bodyEl.innerHTML = '<tr><td colspan="4" class="blocklist-empty">No IPs currently blocked.</td></tr>';
     if (moreBtn) moreBtn.hidden = true;
     return;
   }
@@ -642,6 +632,7 @@ function renderBlocklist(blocklist) {
       `<td class="blocklist-ip">${escHtml(e.ip || "")}</td>` +
       `<td class="blocklist-reason ${sourceClass}">${escHtml(e.reason || "")}</td>` +
       `<td class="blocklist-ts">${escHtml(e.timestamp ? fmtTimestamp(e.timestamp) : "–")}</td>` +
+      `<td class="blocklist-action"><button class="blocklist-unblock-btn" onclick="unblockIp('${escHtml(e.ip)}')">Unblock</button></td>` +
       "</tr>";
   }).join("");
 
@@ -657,9 +648,9 @@ function blocklistLoadMore() {
   renderBlocklist({ entries: _blocklistEntries });
 }
 
-async function psadBlock(ip) {
+async function blockIp(ip) {
   try {
-    const resp = await fetch("/api/psad/block", {
+    const resp = await fetch("/api/blocklist/block", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ip }),
@@ -676,9 +667,9 @@ async function psadBlock(ip) {
   fetchStats(false);
 }
 
-async function psadUnblock(ip) {
+async function unblockIp(ip) {
   try {
-    const resp = await fetch("/api/psad/unblock", {
+    const resp = await fetch("/api/blocklist/unblock", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ip }),

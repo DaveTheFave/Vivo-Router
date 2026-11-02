@@ -786,42 +786,6 @@ main.grid {
   color: var(--text);
 }
 
-.psad-blocked-list {
-  margin-top: 10px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.psad-blocked-chip {
-  background: rgba(248, 81, 73, .15);
-  border: 1px solid var(--red);
-  color: var(--red);
-  border-radius: 20px;
-  padding: 3px 6px 3px 10px;
-  font-size: .76rem;
-  font-family: var(--font-mono);
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.psad-chip-unblock {
-  background: transparent;
-  border: none;
-  color: var(--red);
-  font-size: .9rem;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0 2px;
-  border-radius: 50%;
-}
-
-.psad-chip-unblock:hover {
-  background: var(--red);
-  color: #fff;
-}
-
 .psad-section-label {
   margin-top: 12px;
   margin-bottom: 6px;
@@ -898,17 +862,6 @@ main.grid {
 .psad-block-btn:hover {
   background: var(--red);
   color: #fff;
-}
-
-.psad-unblock-btn {
-  background: transparent;
-  border: 1px solid var(--green);
-  color: var(--green);
-}
-
-.psad-unblock-btn:hover {
-  background: var(--green);
-  color: #000;
 }
 
 .psad-detail-toggle {
@@ -1073,6 +1026,30 @@ main.grid {
   color: var(--text-muted);
   font-size: .72rem;
   white-space: nowrap;
+}
+
+.blocklist-action {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.blocklist-unblock-btn {
+  font-family: var(--font-sans, inherit);
+  font-size: .68rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: .3px;
+  background: transparent;
+  border: 1px solid var(--green);
+  color: var(--green);
+}
+
+.blocklist-unblock-btn:hover {
+  background: var(--green);
+  color: #000;
 }
 
 .blocklist-empty {

@@ -1561,8 +1561,12 @@ def _append_manual_event(event: dict) -> None:
         MANUAL_BLOCKS_EVENTS_FILE.write_text(json.dumps(events, indent=2))
 
 
-def psad_manual_block(ip: str) -> tuple[bool, str]:
-    """Manually block an IP via the dashboard's own nftables set."""
+def manual_block(ip: str) -> tuple[bool, str]:
+    """Manually block an IP via the dashboard's own nftables set.
+
+    Used by both the PSAD panel (to act on a freshly detected scan) and
+    the Blocklist panel's own management UI.
+    """
     if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
         return False, "Invalid IP address"
 
@@ -1584,13 +1588,13 @@ def psad_manual_block(ip: str) -> tuple[bool, str]:
     return True, "Blocked"
 
 
-def psad_manual_unblock(ip: str) -> tuple[bool, str]:
+def manual_unblock(ip: str) -> tuple[bool, str]:
     """Remove every block on an IP — the dashboard's own manual-block set
     entry (if any) AND every psad auto-block rule for it across all three
     chains psad manages (if any). A single "Unblock" action has to clear
     all of these: psad spreads one block across PSAD_BLOCK_INPUT/OUTPUT/
     FORWARD, and clearing only one (the original bug here) leaves the IP
-    silently still dropped by the others.
+    silently still dropped by the others. Called from the Blocklist panel.
     """
     if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
         return False, "Invalid IP address"
@@ -1906,9 +1910,10 @@ def get_blocklist_activity() -> dict:
     Reasons come from two places: the suricata-autoblock audit log (for
     IPs the autoblock timer added, with the triggering signature and
     target service) and the dashboard's own manual block/unblock event
-    log (for IPs blocked by hand via the PSAD panel's Block button).
-    An IP can be in neither — e.g. one added directly via nft before
-    either of those existed — and is still shown, flagged as such.
+    log (for IPs blocked by hand via the PSAD panel's or this panel's
+    own Block/Unblock buttons). An IP can be in neither — e.g. one added
+    directly via nft before either of those existed — and is still
+    shown, flagged as such.
     """
     current_ips = set(get_manual_blocked_ips())
 
@@ -2205,19 +2210,19 @@ def api_psad():
     return jsonify(get_psad_activity())
 
 
-@app.route("/api/psad/block", methods=["POST"])
-def api_psad_block():
+@app.route("/api/blocklist/block", methods=["POST"])
+def api_blocklist_block():
     data = request.get_json(force=True) or {}
     ip = str(data.get("ip", "")).strip()
-    ok, msg = psad_manual_block(ip)
+    ok, msg = manual_block(ip)
     return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
 
 
-@app.route("/api/psad/unblock", methods=["POST"])
-def api_psad_unblock():
+@app.route("/api/blocklist/unblock", methods=["POST"])
+def api_blocklist_unblock():
     data = request.get_json(force=True) or {}
     ip = str(data.get("ip", "")).strip()
-    ok, msg = psad_manual_unblock(ip)
+    ok, msg = manual_unblock(ip)
     return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
 
 
