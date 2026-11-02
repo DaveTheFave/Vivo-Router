@@ -1878,6 +1878,89 @@ def get_recent_errors(n: int = 20) -> list:
     return errors[:n]
 
 
+AUTOBLOCK_LOG_FILE = Path("/var/log/suricata-autoblock.jsonl")
+
+
+def _load_autoblock_events() -> list:
+    if not AUTOBLOCK_LOG_FILE.exists():
+        return []
+    events = []
+    try:
+        for line in AUTOBLOCK_LOG_FILE.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except Exception:
+                continue
+    except Exception as exc:
+        log.debug(f"_load_autoblock_events: read failed: {exc}")
+    return events
+
+
+def get_blocklist_activity() -> dict:
+    """Return every IP currently in the dashboard's block set, each with
+    the most recent reason we have on record for it.
+
+    Reasons come from two places: the suricata-autoblock audit log (for
+    IPs the autoblock timer added, with the triggering signature and
+    target service) and the dashboard's own manual block/unblock event
+    log (for IPs blocked by hand via the PSAD panel's Block button).
+    An IP can be in neither — e.g. one added directly via nft before
+    either of those existed — and is still shown, flagged as such.
+    """
+    current_ips = set(get_manual_blocked_ips())
+
+    # Latest known event per IP, from whichever source is more recent.
+    latest: dict = {}
+
+    for ev in _load_autoblock_events():
+        ip = ev.get("ip")
+        if ip not in current_ips:
+            continue
+        ts = ev.get("timestamp", "")
+        if ip not in latest or ts > latest[ip]["timestamp"]:
+            dest = ev.get("dest_ip") or ""
+            if dest and ev.get("dest_port"):
+                dest = f"{dest}:{ev['dest_port']}"
+            reason = ev.get("signature") or ev.get("category") or "Reputation-flagged IP"
+            if dest:
+                reason = f"{reason} → {dest}"
+            latest[ip] = {"timestamp": ts, "reason": reason, "source": "auto"}
+
+    for ev in _load_manual_events():
+        if ev.get("type") != "manual_block":
+            continue
+        ip = ev.get("ip")
+        if ip not in current_ips:
+            continue
+        ts = ev.get("timestamp", "")
+        if ip not in latest or ts > latest[ip]["timestamp"]:
+            latest[ip] = {
+                "timestamp": ts,
+                "reason": ev.get("detail") or "Manually blocked from dashboard",
+                "source": "manual",
+            }
+
+    entries = []
+    for ip in current_ips:
+        info = latest.get(ip)
+        if info:
+            entries.append({"ip": ip, **info})
+        else:
+            entries.append({
+                "ip": ip,
+                "timestamp": "",
+                "reason": "No record of why — added before activity logging existed",
+                "source": "unknown",
+            })
+
+    entries.sort(key=lambda e: e["timestamp"], reverse=True)
+
+    return {"total": len(entries), "entries": entries}
+
+
 UPNP_LEASE_FILE = Path("/var/log/miniupnpd.leases")
 
 # Well-known ports/ranges for guessing why a UPnP mapping was opened.
@@ -2083,6 +2166,7 @@ def api_stats():
     psad = get_psad_activity()
     suricata = get_suricata_activity()
     upnp = get_upnp_activity(clients)
+    blocklist = get_blocklist_activity()
 
     wan_iface = CONF["WAN_IFACE"]
     lan_iface = CONF["LAN_IFACE"]
@@ -2107,6 +2191,7 @@ def api_stats():
         "psad": psad,
         "suricata": suricata,
         "upnp": upnp,
+        "blocklist": blocklist,
     })
 
 
@@ -2149,6 +2234,11 @@ def api_suricata():
 @app.route("/api/upnp")
 def api_upnp():
     return jsonify(get_upnp_activity())
+
+
+@app.route("/api/blocklist")
+def api_blocklist():
+    return jsonify(get_blocklist_activity())
 
 
 @app.route("/api/pihole")

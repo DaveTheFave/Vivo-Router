@@ -1010,6 +1010,94 @@ main.grid {
   white-space: nowrap;
 }
 
+/* ── Blocklist panel ─────────────────────────────────────────────────────── */
+.blocklist-count {
+  font-size: .75rem;
+  color: var(--text-muted);
+}
+
+.blocklist-table-wrap {
+  max-height: 320px;
+  overflow-y: auto;
+  overflow-x: auto;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+
+.blocklist-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .78rem;
+}
+
+.blocklist-table th {
+  position: sticky;
+  top: 0;
+  background: var(--surface2);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  font-size: .68rem;
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.blocklist-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid rgba(48,54,61,.35);
+  color: var(--text);
+  vertical-align: top;
+}
+
+.blocklist-table tr:last-child td {
+  border-bottom: none;
+}
+
+.blocklist-ip {
+  font-family: var(--font-mono);
+  color: var(--red);
+  white-space: nowrap;
+}
+
+.blocklist-reason {
+  color: var(--text);
+}
+
+.blocklist-reason.blocklist-src-unknown {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.blocklist-ts {
+  color: var(--text-muted);
+  font-size: .72rem;
+  white-space: nowrap;
+}
+
+.blocklist-empty {
+  color: var(--text-muted);
+  font-style: italic;
+  text-align: center;
+  white-space: normal;
+}
+
+.blocklist-load-more {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: .78rem;
+  transition: border-color .15s, color .15s;
+}
+
+.blocklist-load-more:hover { border-color: var(--cyan); color: var(--cyan); }
+
 /* ── UPnP port mappings panel ────────────────────────────────────────────── */
 .upnp-status-badge {
   font-size: .75rem;

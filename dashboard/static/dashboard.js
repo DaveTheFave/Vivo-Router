@@ -92,6 +92,7 @@ async function fetchStats(resolveNames = false) {
   renderPsad(data.psad || {});
   renderUpnp(data.upnp || {});
   renderSuricata(data.suricata || {});
+  renderBlocklist(data.blocklist || {});
   renderErrors(data.recent_errors || []);
   setText("last-updated", "Last updated: " + new Date().toLocaleTimeString());
 }
@@ -612,6 +613,48 @@ function renderUpnp(upnp) {
       `<td class="upnp-expires">${escHtml(fmtTimestamp(m.expires))}</td>` +
       "</tr>";
   }).join("");
+}
+
+const BLOCKLIST_PAGE_SIZE = 20;
+let _blocklistEntries = [];
+let _blocklistShown = BLOCKLIST_PAGE_SIZE;
+
+function renderBlocklist(blocklist) {
+  const entries = Array.isArray(blocklist.entries) ? blocklist.entries : [];
+  _blocklistEntries = entries;
+
+  setText("blocklist-count", `${entries.length} blocked`);
+
+  const bodyEl = document.getElementById("blocklist-table-body");
+  const moreBtn = document.getElementById("blocklist-load-more");
+  if (!bodyEl) return;
+
+  if (!entries.length) {
+    bodyEl.innerHTML = '<tr><td colspan="3" class="blocklist-empty">No IPs currently blocked.</td></tr>';
+    if (moreBtn) moreBtn.hidden = true;
+    return;
+  }
+
+  const shown = entries.slice(0, Math.min(_blocklistShown, entries.length));
+  bodyEl.innerHTML = shown.map(e => {
+    const sourceClass = `blocklist-src-${escHtml(e.source || "unknown")}`;
+    return "<tr>" +
+      `<td class="blocklist-ip">${escHtml(e.ip || "")}</td>` +
+      `<td class="blocklist-reason ${sourceClass}">${escHtml(e.reason || "")}</td>` +
+      `<td class="blocklist-ts">${escHtml(e.timestamp ? fmtTimestamp(e.timestamp) : "–")}</td>` +
+      "</tr>";
+  }).join("");
+
+  if (moreBtn) {
+    const remaining = entries.length - shown.length;
+    moreBtn.hidden = remaining <= 0;
+    moreBtn.textContent = `Load more (${remaining} more)`;
+  }
+}
+
+function blocklistLoadMore() {
+  _blocklistShown += BLOCKLIST_PAGE_SIZE;
+  renderBlocklist({ entries: _blocklistEntries });
 }
 
 async function psadBlock(ip) {

@@ -100,6 +100,29 @@
   <!-- ── Row 2: left column ───────────────────────────────────────────────── -->
   <div class="col-left">
 
+    <!-- Blocklist panel -->
+    <div class="panel" id="blocklist-panel">
+      <div class="panel-header">
+        <span class="panel-title">🚫 Blocklist</span>
+        <span class="blocklist-count" id="blocklist-count">0 blocked</span>
+      </div>
+      <div class="blocklist-table-wrap">
+        <table class="blocklist-table">
+          <thead>
+            <tr>
+              <th>IP</th>
+              <th>Why</th>
+              <th>Blocked</th>
+            </tr>
+          </thead>
+          <tbody id="blocklist-table-body">
+            <tr><td colspan="3" class="blocklist-empty">No IPs currently blocked.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <button class="blocklist-load-more" id="blocklist-load-more" hidden onclick="blocklistLoadMore()">Load more</button>
+    </div>
+
     <!-- Network Health panel -->
     <div class="panel" id="network-health-panel">
       <div class="panel-header">
