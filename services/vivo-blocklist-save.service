@@ -1,0 +1,7 @@
+[Unit]
+Description=Snapshot the dashboard blocklist set to /etc/nftables.d/blocklist.nft
+After=nftables.service vivo-router-dashboard.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vivo-save-blocklist
