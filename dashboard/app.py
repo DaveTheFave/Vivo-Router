@@ -87,45 +87,190 @@ PORT_FORWARDS_FILE = BASE_DIR / "port_forwards.json"
 _pf_lock = threading.Lock()
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
+
+
+@app.context_processor
+def _static_version():
+    """`asset_v("dashboard.js")` → the file's mtime, appended to static URLs
+    as ?v=… so the kiosk's Chromium fetches the new JS/CSS after every
+    update instead of running a cached copy for days (Flask sends static
+    files with Last-Modified and no Cache-Control, which Chromium treats as
+    heuristically fresh for ~10% of the file's age)."""
+    def asset_v(name: str) -> str:
+        try:
+            return str(int((Path(app.static_folder) / name).stat().st_mtime))
+        except OSError:
+            return "0"
+    return {"asset_v": asset_v}
+
+
+@app.after_request
+def _no_stale_assets(resp):
+    if request.path == "/" or request.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vivo-router")
 
-# ── bandwidth history (rolling 1-hour buffer) ─────────────────────────────────
+# ── link sampling + bandwidth history (rolling 1-hour buffer) ────────────────
+#
+# One background thread reads the interface byte counters every
+# LINK_SAMPLE_SEC and is the only thing that computes rates. Before this,
+# every /api/stats call computed its rate against whichever request came
+# before it (kiosk, a laptop, /api/speeds…), so the numbers depended on who
+# else had the page open, and the 1-hour graph stored one of those
+# instantaneous 5-second readings per minute: a speed test or download that
+# didn't happen to straddle that one reading never showed up at all.
+#
+# Now each 1-minute history point carries the true average over the whole
+# minute (counter delta / elapsed time) plus the peak 2-second rate seen in
+# it, and history keeps accumulating even when no dashboard is open.
 
-class BandwidthHistory:
-    """Maintain rolling 1-hour history of WAN/LAN bandwidth samples."""
-    def __init__(self, max_samples=60):
-        self.wan_history = deque(maxlen=max_samples)
-        self.lan_history = deque(maxlen=max_samples)
-        self.last_sample_time = 0
-        self.sample_interval = 60  # sample every 60 seconds
+LINK_SAMPLE_SEC = 2.0
+HISTORY_BUCKET_SEC = 60
+HISTORY_MAX_BUCKETS = 60
 
-    def update(self, wan_speed: dict, lan_speed: dict):
-        """Add a sample to the history if enough time has passed."""
-        now = time.time()
-        if now - self.last_sample_time < self.sample_interval:
+
+def _read_iface_counters() -> dict:
+    """Return {iface: (rx_bytes, tx_bytes)} from /proc/net/dev.
+
+    Splits each line on the first ':' rather than on whitespace: older
+    kernels print the RX byte count flush against the colon once it
+    outgrows the column ("enx.201:1234567890 …"), which a plain split()
+    misreads — on a gigabit link that happens within the first second.
+    """
+    counters = {}
+    with open("/proc/net/dev") as f:
+        for line in f.readlines()[2:]:
+            name, sep, rest = line.partition(":")
+            if not sep:
+                continue
+            fields = rest.split()
+            if len(fields) < 9:
+                continue
+            try:
+                counters[name.strip()] = (int(fields[0]), int(fields[8]))
+            except ValueError:
+                continue
+    return counters
+
+
+class LinkSampler:
+    """Background sampler: current per-interface rates + 1-hour history."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._prev = None          # (ts, counters) from the last sample
+        self._rates = {}           # iface -> (rx_Bps, tx_Bps), latest sample
+        self._bucket = None        # open history bucket being accumulated
+        self.wan_history = deque(maxlen=HISTORY_MAX_BUCKETS)
+        self.lan_history = deque(maxlen=HISTORY_MAX_BUCKETS)
+        self._thread = None
+
+    # -- sampling ----------------------------------------------------------
+    def start(self):
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="link-sampler", daemon=True)
+            self._thread.start()
+
+    def _run(self):
+        while True:
+            try:
+                self.sample()
+            except Exception as exc:
+                log.warning("link sampler: %s", exc)
+            time.sleep(LINK_SAMPLE_SEC)
+
+    def sample(self, now: float = None, counters: dict = None):
+        now = time.time() if now is None else now
+        counters = _read_iface_counters() if counters is None else counters
+        with self._lock:
+            if self._prev is not None:
+                pts, pcounters = self._prev
+                dt = now - pts
+                if dt > 0:
+                    rates = {}
+                    for iface, (rx, tx) in counters.items():
+                        if iface in pcounters:
+                            prx, ptx = pcounters[iface]
+                            # A counter going backwards means the interface
+                            # was recreated (VLAN/link bounce): report 0
+                            # rather than a huge negative/garbage rate.
+                            rates[iface] = (max(rx - prx, 0) / dt, max(tx - ptx, 0) / dt)
+                    self._rates = rates
+            self._prev = (now, counters)
+            self._accumulate(now, counters)
+
+    def _accumulate(self, now: float, counters: dict):
+        wan, lan = resolve_wan_iface(counters), CONF["LAN_IFACE"]
+        if self._bucket is None:
+            self._bucket = {"start": now, "counters": counters, "peak": {}}
             return
-        self.last_sample_time = now
-        
-        self.wan_history.append({
-            "ts": now,
-            "rx_mbps": (wan_speed.get("rx_bytes_sec", 0) * 8) / 1_000_000,
-            "tx_mbps": (wan_speed.get("tx_bytes_sec", 0) * 8) / 1_000_000,
-        })
-        self.lan_history.append({
-            "ts": now,
-            "rx_mbps": (lan_speed.get("rx_bytes_sec", 0) * 8) / 1_000_000,
-            "tx_mbps": (lan_speed.get("tx_bytes_sec", 0) * 8) / 1_000_000,
-        })
+        b = self._bucket
+        for iface in (wan, lan):
+            rx, tx = self._rates.get(iface, (0.0, 0.0))
+            prx, ptx = b["peak"].get(iface, (0.0, 0.0))
+            b["peak"][iface] = (max(prx, rx), max(ptx, tx))
+        elapsed = now - b["start"]
+        if elapsed < HISTORY_BUCKET_SEC:
+            return
+        for iface, hist in ((wan, self.wan_history), (lan, self.lan_history)):
+            hist.append(self._bucket_point(now, elapsed, b, counters, iface))
+        self._bucket = {"start": now, "counters": counters, "peak": {}}
 
-    def get_history(self) -> dict:
-        """Return current history as dict of lists."""
+    @staticmethod
+    def _bucket_point(now, elapsed, bucket, counters, iface) -> dict:
+        cur = counters.get(iface)
+        start = bucket["counters"].get(iface)
+        if cur and start:
+            rx_avg = max(cur[0] - start[0], 0) / elapsed
+            tx_avg = max(cur[1] - start[1], 0) / elapsed
+        else:
+            rx_avg = tx_avg = 0.0
+        rx_peak, tx_peak = bucket["peak"].get(iface, (0.0, 0.0))
+        to_mbps = lambda bps: round(bps * 8 / 1_000_000, 3)
         return {
-            "wan": list(self.wan_history),
-            "lan": list(self.lan_history),
+            "ts": round(now),
+            "rx_mbps": to_mbps(rx_avg),
+            "tx_mbps": to_mbps(tx_avg),
+            # The peak 2-s rate can't be below the minute's average.
+            "rx_peak_mbps": to_mbps(max(rx_peak, rx_avg)),
+            "tx_peak_mbps": to_mbps(max(tx_peak, tx_avg)),
         }
 
-bandwidth_history = BandwidthHistory()
+    # -- readers -----------------------------------------------------------
+    def rates(self) -> dict:
+        with self._lock:
+            return dict(self._rates)
+
+    def get_history(self) -> dict:
+        with self._lock:
+            return {"wan": list(self.wan_history), "lan": list(self.lan_history)}
+
+
+def resolve_wan_iface(counters: dict = None) -> str:
+    """The configured WAN_IFACE if it exists, else the default-route device.
+
+    With a tagged WAN (e.g. VLAN 201 on enx00051b516db8 → enx.201) the
+    traffic counters that matter are on the VLAN device. If router.conf
+    still names the parent, or the VLAN was renamed, fall back to whatever
+    device carries the default route instead of showing an empty row.
+    """
+    configured = CONF["WAN_IFACE"]
+    if counters is None:
+        try:
+            counters = _read_iface_counters()
+        except Exception:
+            return configured
+    if configured in counters:
+        return configured
+    m = re.search(r"\bdev (\S+)", _run(["ip", "-4", "route", "show", "default"]) or "")
+    if m and m.group(1) in counters:
+        return m.group(1)
+    return configured
+
+
+link_sampler = LinkSampler()
 
 
 class GatewayTimeoutTracker:
@@ -283,7 +428,7 @@ def resolve_hostname_pihole(ip: str) -> str | None:
 
 def get_wan_ip() -> str:
     """Detect WAN IP by querying the WAN interface address or a public endpoint."""
-    iface = CONF["WAN_IFACE"]
+    iface = resolve_wan_iface()
     # Try the interface address first (faster, no external call)
     out = _run(["ip", "-4", "-o", "addr", "show", iface])
     match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
@@ -301,45 +446,28 @@ def get_wan_ip() -> str:
 
 
 def get_link_speeds() -> dict:
-    """
-    Read TX/RX byte counters from /proc/net/dev and compute per-second rates.
-    Uses a module-level cache to store the previous sample.
+    """Current per-interface rates from the background LinkSampler.
+
+    Reported in bits per second (decimal Mbit/s, Gbit/s) to match how ISPs
+    and speed tests quote a line — "925 Mbit/s", not "110.3 MB/s".
     """
     results = {}
-    try:
-        now = time.time()
-        with open("/proc/net/dev") as f:
-            lines = f.readlines()
-        for line in lines[2:]:
-            parts = line.split()
-            if len(parts) < 10:
-                continue
-            iface = parts[0].rstrip(":")
-            rx_bytes = int(parts[1])
-            tx_bytes = int(parts[9])
-            key = f"_prev_{iface}"
-            prev = get_link_speeds._cache.get(key)
-            if prev:
-                dt = now - prev["ts"]
-                if dt > 0:
-                    rx_rate = (rx_bytes - prev["rx"]) / dt
-                    tx_rate = (tx_bytes - prev["tx"]) / dt
-                else:
-                    rx_rate = tx_rate = 0.0
-            else:
-                rx_rate = tx_rate = 0.0
-            get_link_speeds._cache[key] = {"ts": now, "rx": rx_bytes, "tx": tx_bytes}
-            results[iface] = {
-                "rx_bytes_sec": round(max(rx_rate, 0)),
-                "tx_bytes_sec": round(max(tx_rate, 0)),
-                "rx_human": _human_bytes(max(rx_rate, 0)),
-                "tx_human": _human_bytes(max(tx_rate, 0)),
-            }
-    except Exception as exc:
-        log.warning("get_link_speeds error: %s", exc)
+    for iface, (rx, tx) in link_sampler.rates().items():
+        results[iface] = {
+            "rx_bytes_sec": round(rx),
+            "tx_bytes_sec": round(tx),
+            "rx_human": _human_bits(rx * 8),
+            "tx_human": _human_bits(tx * 8),
+        }
     return results
 
-get_link_speeds._cache = {}
+
+def _human_bits(bits_per_sec: float) -> str:
+    for unit in ("bit/s", "kbit/s", "Mbit/s"):
+        if bits_per_sec < 1000:
+            return f"{bits_per_sec:.0f} {unit}" if unit == "bit/s" else f"{bits_per_sec:.1f} {unit}"
+        bits_per_sec /= 1000
+    return f"{bits_per_sec:.2f} Gbit/s"
 
 
 def _human_bytes(bps: float) -> str:
@@ -1506,6 +1634,7 @@ def _ensure_dashboard_blocks_table() -> None:
 
 def get_manual_blocked_ips() -> list:
     """Return IPs currently blocked via the dashboard's manual-block set."""
+    global _DASHBOARD_BLOCKS_TABLE_READY
     _ensure_dashboard_blocks_table()
     try:
         result = subprocess.run(
@@ -1513,10 +1642,15 @@ def get_manual_blocked_ips() -> list:
             capture_output=True, text=True, timeout=5
         )
         if result.returncode != 0 or not result.stdout.strip():
+            # The table vanished (nftables.service reload/flush before the
+            # blocklist include existed). Forget that we created it so the
+            # next call rebuilds it instead of reporting an empty list forever.
+            _DASHBOARD_BLOCKS_TABLE_READY = False
+            log.warning("get_manual_blocked_ips: %s", result.stderr.strip() or "empty nft output")
             return []
         data = json.loads(result.stdout)
     except Exception as exc:
-        log.debug(f"get_manual_blocked_ips: nft query failed: {exc}")
+        log.warning(f"get_manual_blocked_ips: nft query failed: {exc}")
         return []
 
     ips = []
@@ -2173,11 +2307,8 @@ def api_stats():
     upnp = get_upnp_activity(clients)
     blocklist = get_blocklist_activity()
 
-    wan_iface = CONF["WAN_IFACE"]
+    wan_iface = resolve_wan_iface()
     lan_iface = CONF["LAN_IFACE"]
-
-    # Update bandwidth history for trends
-    bandwidth_history.update(speeds.get(wan_iface, {}), speeds.get(lan_iface, {}))
 
     return jsonify({
         "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
@@ -2264,9 +2395,13 @@ def api_system():
 @app.route("/api/trends")
 def api_trends():
     """Return bandwidth trend history (rolling 1-hour)."""
-    history = bandwidth_history.get_history()
+    history = link_sampler.get_history()
     return jsonify({
         "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "now": round(time.time()),
+        "bucket_sec": HISTORY_BUCKET_SEC,
+        "window_sec": HISTORY_BUCKET_SEC * HISTORY_MAX_BUCKETS,
+        "wan_iface": resolve_wan_iface(),
         "trends": history,
     })
 
@@ -2375,6 +2510,10 @@ def api_port_forwards_delete(entry_id: str):
         return jsonify({"error": "Not found"}), 404
     _save_port_forwards(new_entries)
     return jsonify({"ok": True})
+
+
+# Started at import so it also runs under a WSGI server, not just app.run().
+link_sampler.start()
 
 
 if __name__ == "__main__":

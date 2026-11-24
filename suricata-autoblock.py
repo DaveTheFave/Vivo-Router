@@ -94,12 +94,20 @@ def read_new_alerts() -> list[dict]:
 
 
 def already_blocked(ip: str) -> bool:
+    """Exact membership test. (A plain substring check on the JSON meant
+    1.2.3.4 counted as blocked whenever 11.2.3.45 was, so it was skipped.)"""
     try:
         out = subprocess.run(
             [NFT, "-j", "list", "set", "inet", "dashboard_blocks", "manual_blocked"],
             capture_output=True, text=True, timeout=5,
         ).stdout
-        return ip in out
+        for item in json.loads(out).get("nftables", []):
+            for elem in (item.get("set") or {}).get("elem", []):
+                if isinstance(elem, dict):
+                    elem = (elem.get("elem") or {}).get("val", elem.get("elem"))
+                if elem == ip:
+                    return True
+        return False
     except Exception:
         return False  # fail open to the block attempt; "nft add" is idempotent anyway
 

@@ -551,15 +551,44 @@ main.grid {
   color: var(--text);
 }
 
+.trends-sub { color: var(--text-muted); font-weight: 400; font-size: .85rem; }
+.trends-summary { color: var(--text-muted); font-size: .85rem; font-variant-numeric: tabular-nums; }
+.trends-canvas-wrap { position: relative; margin-bottom: 12px; }
 .bandwidth-chart {
   width: 100%;
-  height: auto;
+  height: 170px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface2);
   display: block;
-  margin-bottom: 12px;
+  touch-action: pan-y;
 }
+.trends-tooltip {
+  position: absolute;
+  top: 8px;
+  pointer-events: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: .8rem;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: nowrap;
+  box-shadow: var(--shadow);
+  font-variant-numeric: tabular-nums;
+}
+.trends-tooltip .tt-time { color: var(--text-muted); }
+.trends-tooltip .tt-peak { color: var(--text-muted); margin-left: 6px; }
+.legend-swatch {
+  display: inline-block;
+  width: 14px;
+  height: 3px;
+  border-radius: 2px;
+  vertical-align: middle;
+  margin-right: 4px;
+}
+.legend-note { font-size: .78rem; }
 
 .trends-legend {
   display: flex;
