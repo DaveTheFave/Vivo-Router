@@ -1044,12 +1044,39 @@ main.grid {
 
 .blocklist-reason {
   color: var(--text);
+  width: 60%;
+  min-width: 260px;
 }
 
 .blocklist-reason.blocklist-src-unknown {
   color: var(--text-muted);
   font-style: italic;
 }
+
+.blocklist-badge {
+  display: inline-block;
+  font-size: .62rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .3px;
+  padding: 1px 5px;
+  margin-right: 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  vertical-align: 1px;
+}
+.blocklist-badge-suricata { border-color: var(--orange); color: var(--orange); }
+.blocklist-badge-auto     { border-color: var(--yellow); color: var(--yellow); }
+.blocklist-badge-manual   { border-color: var(--blue);   color: var(--blue);   }
+.blocklist-meta {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: .7rem;
+}
+.blocklist-sev-1 { color: var(--red); font-weight: 600; }
+.blocklist-sev-2 { color: var(--orange); }
+.blocklist-permanent { color: var(--text-muted); font-style: italic; }
 
 .blocklist-ts {
   color: var(--text-muted);
@@ -1102,6 +1129,7 @@ main.grid {
   transition: border-color .15s, color .15s;
 }
 
+.blocklist-load-more[hidden] { display: none; }
 .blocklist-load-more:hover { border-color: var(--cyan); color: var(--cyan); }
 
 /* ── UPnP port mappings panel ────────────────────────────────────────────── */

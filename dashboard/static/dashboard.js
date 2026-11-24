@@ -617,18 +617,59 @@ const BLOCKLIST_PAGE_SIZE = 20;
 let _blocklistEntries = [];
 let _blocklistShown = BLOCKLIST_PAGE_SIZE;
 
+function fmtShortTs(isoTs) {
+  if (!isoTs) return "–";
+  const dt = new Date(isoTs);
+  if (Number.isNaN(dt.getTime())) return "–";
+  return dt.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+function fmtExpiresIn(secs) {
+  if (secs === null || secs === undefined) return "";
+  const s = Math.max(0, Number(secs) || 0);
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `in ${d}d ${h}h`;
+  if (h > 0) return `in ${h}h ${m}m`;
+  return `in ${Math.max(m, 1)}m`;
+}
+
+const BLOCKLIST_SOURCE_LABEL = {
+  suricata: "Suricata",
+  auto: "Auto",
+  manual: "Manual",
+  unknown: "Unknown",
+};
+
+function _blocklistWhyCell(e) {
+  const src = e.source || "unknown";
+  const badge = `<span class="blocklist-badge blocklist-badge-${escHtml(src)}">${escHtml(BLOCKLIST_SOURCE_LABEL[src] || src)}</span>`;
+  let html = badge + `<span class="blocklist-reason-text">${escHtml(e.reason || "")}</span>`;
+  const meta = [];
+  if (e.category) meta.push(escHtml(e.category));
+  if (e.severity_label) meta.push(`<span class="blocklist-sev blocklist-sev-${escHtml(String(e.severity))}">${escHtml(e.severity_label)}</span>`);
+  if (e.sid) meta.push("SID " + escHtml(String(e.sid)));
+  if (e.target) meta.push("→ " + escHtml(e.target));
+  if (e.alert_time) meta.push("alert " + escHtml(fmtShortTs(e.alert_time)));
+  if (meta.length) html += `<div class="blocklist-meta">${meta.join(" · ")}</div>`;
+  return html;
+}
+
 function renderBlocklist(blocklist) {
   const entries = Array.isArray(blocklist.entries) ? blocklist.entries : [];
   _blocklistEntries = entries;
 
-  setText("blocklist-count", `${entries.length} blocked`);
+  let countText = `${entries.length} blocked`;
+  if (blocklist.suricata_count !== undefined) {
+    countText += ` · ${blocklist.suricata_count} Suricata (7-day) · ${blocklist.manual_count || 0} permanent`;
+  }
+  setText("blocklist-count", countText);
 
   const bodyEl = document.getElementById("blocklist-table-body");
   const moreBtn = document.getElementById("blocklist-load-more");
   if (!bodyEl) return;
 
   if (!entries.length) {
-    bodyEl.innerHTML = '<tr><td colspan="4" class="blocklist-empty">No IPs currently blocked.</td></tr>';
+    bodyEl.innerHTML = '<tr><td colspan="5" class="blocklist-empty">No IPs currently blocked.</td></tr>';
     if (moreBtn) moreBtn.hidden = true;
     return;
   }
@@ -636,10 +677,14 @@ function renderBlocklist(blocklist) {
   const shown = entries.slice(0, Math.min(_blocklistShown, entries.length));
   bodyEl.innerHTML = shown.map(e => {
     const sourceClass = `blocklist-src-${escHtml(e.source || "unknown")}`;
+    const expires = (e.expires_in_sec === null || e.expires_in_sec === undefined)
+      ? '<span class="blocklist-permanent">Permanent</span>'
+      : `<span title="${escHtml(fmtTimestamp(e.expires_at))}">${escHtml(fmtExpiresIn(e.expires_in_sec))}</span>`;
     return "<tr>" +
       `<td class="blocklist-ip">${escHtml(e.ip || "")}</td>` +
-      `<td class="blocklist-reason ${sourceClass}">${escHtml(e.reason || "")}</td>` +
-      `<td class="blocklist-ts">${escHtml(e.timestamp ? fmtTimestamp(e.timestamp) : "–")}</td>` +
+      `<td class="blocklist-reason ${sourceClass}">${_blocklistWhyCell(e)}</td>` +
+      `<td class="blocklist-ts" title="${escHtml(fmtTimestamp(e.timestamp))}">${escHtml(fmtShortTs(e.timestamp))}</td>` +
+      `<td class="blocklist-ts">${expires}</td>` +
       `<td class="blocklist-action"><button class="blocklist-unblock-btn" onclick="unblockIp('${escHtml(e.ip)}')">Unblock</button></td>` +
       "</tr>";
   }).join("");
