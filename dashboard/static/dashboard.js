@@ -82,18 +82,26 @@ async function fetchStats(resolveNames = false) {
     return;
   }
 
-  renderWan(data);
-  renderSpeeds(data);
-  renderClients(data.active_clients || []);
-  renderSystem(data.system || {});
-  renderPihole(data.pihole || {});
-  renderHealth(data);
-  renderGatewayTimeout(data.gateway_timeout || {});
-  renderPsad(data.psad || {});
-  renderUpnp(data.upnp || {});
-  renderSuricata(data.suricata || {});
-  renderBlocklist(data.blocklist || {});
-  renderErrors(data.recent_errors || []);
+  // Each panel renders in isolation: one panel throwing on unexpected data
+  // used to abort fetchStats() and silently freeze every panel after it —
+  // the Blocklist is rendered near the end, so it was the usual casualty.
+  const panels = [
+    ["wan", () => renderWan(data)],
+    ["speeds", () => renderSpeeds(data)],
+    ["clients", () => renderClients(data.active_clients || [])],
+    ["system", () => renderSystem(data.system || {})],
+    ["pihole", () => renderPihole(data.pihole || {})],
+    ["health", () => renderHealth(data)],
+    ["gateway", () => renderGatewayTimeout(data.gateway_timeout || {})],
+    ["psad", () => renderPsad(data.psad || {})],
+    ["upnp", () => renderUpnp(data.upnp || {})],
+    ["suricata", () => renderSuricata(data.suricata || {})],
+    ["blocklist", () => renderBlocklist(data.blocklist || {})],
+    ["errors", () => renderErrors(data.recent_errors || [])],
+  ];
+  for (const [name, render] of panels) {
+    try { render(); } catch (err) { console.error(`render ${name} failed:`, err); }
+  }
   setText("last-updated", "Last updated: " + new Date().toLocaleTimeString());
 }
 
@@ -763,138 +771,226 @@ async function initBatteryMonitor() {
 initBatteryMonitor();
 
 // ── bandwidth trends chart ────────────────────────────────────────────────────
+//
+// WAN only: the LAN lines were the same traffic seen from the other side
+// (LAN TX ≈ WAN RX), and labelled RX/TX, which reads backwards for the LAN.
+// Each point is a 1-minute bucket from the server's background sampler:
+// the solid line is the minute's true average, the faint line above it the
+// fastest 2-second burst in that minute (so a speed test shows its real
+// ~900 Mbit/s even though the minute's average is much lower).
+// X is real time (last 60 min), so 5 minutes of history no longer gets
+// stretched across the whole width as if it were an hour.
+
+const CHART_COLORS = {
+  down: "#4a95e8",  // download — blue
+  up: "#d9772f",    // upload — orange (validated vs blue for CVD on the dark surface)
+};
+let _trendData = null;
+let _trendHoverX = null;
+
 async function renderTrends() {
   try {
     const resp = await fetch("/api/trends", { cache: "no-store" });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
-    const data = await resp.json();
-    
-    const canvas = document.getElementById("bandwidth-chart");
-    if (!canvas) return;
-    
-    drawBandwidthChart(canvas, data.trends || {});
+    _trendData = await resp.json();
+    drawBandwidthChart();
+    renderTrendSummary();
   } catch (err) {
     console.warn("renderTrends error:", err);
   }
 }
 
-function drawBandwidthChart(canvas, trends) {
+function fmtMbps(v, digits = 0) {
+  if (v >= 1000) return (v / 1000).toFixed(v >= 10000 ? 0 : 2).replace(/\.?0+$/, "") + " Gbit/s";
+  if (v > 0 && v < 1) return v.toFixed(2) + " Mbit/s";
+  return v.toFixed(digits) + " Mbit/s";
+}
+
+function niceCeil(v) {
+  // Round up to 1/2/2.5/5 × 10^n so gridlines land on readable values
+  // (0/250/500/750/1000 rather than 0/231/462/693/924).
+  if (v <= 0) return 10;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (v <= m * p) return m * p;
+  return 10 * p;
+}
+
+function renderTrendSummary() {
+  const el = document.getElementById("trends-summary");
+  if (!el || !_trendData) return;
+  const wan = (_trendData.trends || {}).wan || [];
+  if (!wan.length) { el.textContent = ""; return; }
+  const pd = Math.max(...wan.map(d => d.rx_peak_mbps ?? d.rx_mbps ?? 0));
+  const pu = Math.max(...wan.map(d => d.tx_peak_mbps ?? d.tx_mbps ?? 0));
+  el.textContent = `Peak ↓ ${fmtMbps(pd)} · ↑ ${fmtMbps(pu)}`;
+}
+
+function drawBandwidthChart() {
+  const canvas = document.getElementById("bandwidth-chart");
+  if (!canvas) return;
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
-  
-  // Get dimensions
-  const w = canvas.width;
-  const h = canvas.height;
-  
-  // Clear canvas
-  ctx.fillStyle = getComputedStyle(canvas).backgroundColor || "#1c2330";
-  ctx.fillRect(0, 0, w, h);
-  
-  const wan = trends.wan || [];
-  const lan = trends.lan || [];
-  const allData = [...wan, ...lan];
-  
-  if (allData.length === 0) {
-    // No data yet
-    ctx.fillStyle = "rgba(139, 148, 158, 0.5)";
-    ctx.font = "13px Segoe UI";
+
+  // Size the backing store to the displayed size × devicePixelRatio, so the
+  // chart is crisp instead of a 400×150 bitmap stretched to the panel width.
+  const cssW = canvas.clientWidth || 400;
+  const cssH = 170;
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    canvas.style.height = cssH + "px";
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const w = cssW, h = cssH;
+  const css = getComputedStyle(document.documentElement);
+  const muted = css.getPropertyValue("--text-muted").trim() || "#8b949e";
+  const border = css.getPropertyValue("--border").trim() || "#30363d";
+
+  ctx.clearRect(0, 0, w, h);
+
+  const data = _trendData || {};
+  const wan = (data.trends || {}).wan || [];
+  const now = data.now || Date.now() / 1000;
+  const windowSec = data.window_sec || 3600;
+  const bucket = data.bucket_sec || 60;
+
+  if (!wan.length) {
+    ctx.fillStyle = muted;
+    ctx.font = "13px " + (css.getPropertyValue("--font").trim() || "sans-serif");
     ctx.textAlign = "center";
-    ctx.fillText("Collecting trend data...", w / 2, h / 2);
+    ctx.fillText("Collecting data — first point after 1 minute…", w / 2, h / 2);
     return;
   }
-  
-  // Find max value for scaling
-  const maxMbps = Math.max(
-    ...allData.map(d => Math.max(d.rx_mbps || 0, d.tx_mbps || 0))
-  );
-  const scale = maxMbps > 0 ? (h - 20) / maxMbps : 1;
-  
-  // Padding and dimensions
-  const padding = { top: 10, right: 10, bottom: 10, left: 40 };
-  const plotW = w - padding.left - padding.right;
-  const plotH = h - padding.top - padding.bottom;
-  const pointSpacing = wan.length > 1 ? plotW / (wan.length - 1) : plotW;
-  
-  // Draw grid lines
-  ctx.strokeStyle = "rgba(48, 54, 61, 0.5)";
+
+  const maxV = niceCeil(Math.max(
+    10,
+    ...wan.map(d => Math.max(d.rx_peak_mbps ?? d.rx_mbps ?? 0, d.tx_peak_mbps ?? d.tx_mbps ?? 0))
+  ));
+
+  const pad = { top: 8, right: 10, bottom: 22, left: 78 };
+  const plotW = w - pad.left - pad.right;
+  const plotH = h - pad.top - pad.bottom;
+  const t0 = now - windowSec;
+  const xOf = ts => pad.left + ((ts - t0) / windowSec) * plotW;
+  const yOf = v => pad.top + plotH - (Math.min(v, maxV) / maxV) * plotH;
+
+  // Recessive grid + y labels
+  ctx.font = "11px " + (css.getPropertyValue("--font-mono").trim() || "monospace");
   ctx.lineWidth = 1;
   for (let i = 0; i <= 4; i++) {
-    const y = padding.top + (plotH / 4) * i;
-    ctx.beginPath();
-    ctx.moveTo(padding.left, y);
-    ctx.lineTo(w - padding.right, y);
-    ctx.stroke();
+    const v = (maxV / 4) * i;
+    const y = Math.round(yOf(v)) + 0.5;
+    ctx.strokeStyle = i === 0 ? muted : border;
+    ctx.globalAlpha = i === 0 ? 0.6 : 0.6;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(w - pad.right, y); ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = muted;
+    ctx.textAlign = "right";
+    ctx.fillText(fmtMbps(v), pad.left - 6, y + 4);
   }
-  
-  // Draw Y-axis scale labels
-  ctx.fillStyle = "rgba(139, 148, 158, 0.7)";
-  ctx.font = "11px monospace";
-  ctx.textAlign = "right";
-  for (let i = 0; i <= 4; i++) {
-    const mbps = (maxMbps / 4) * i;
-    const y = padding.top + plotH - (plotH / 4) * i;
-    ctx.fillText(mbps.toFixed(0) + " Mb/s", padding.left - 5, y + 3);
+  // X labels (minutes ago)
+  ctx.textAlign = "center";
+  for (const m of [60, 45, 30, 15, 0]) {
+    const x = xOf(now - m * 60);
+    ctx.textAlign = m === 60 ? "left" : (m === 0 ? "right" : "center");
+    ctx.fillText(m === 0 ? "now" : `−${m}m`, x, h - 6);
   }
-  
-  // Draw axes
-  ctx.strokeStyle = "rgba(139, 148, 158, 0.8)";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(padding.left, padding.top);
-  ctx.lineTo(padding.left, h - padding.bottom);
-  ctx.lineTo(w - padding.right, h - padding.bottom);
-  ctx.stroke();
-  
-  // Draw lines for each data stream
-  const colors = {
-    wan_rx: "#FF6B6B",  // red
-    wan_tx: "#4ECDC4",  // cyan
-    lan_rx: "#95E1D3",  // light green
-    lan_tx: "#FFE66D",  // yellow
-  };
-  
-  function drawLine(dataArray, color) {
-    if (!dataArray || dataArray.length === 0) return;
-    
+
+  // Split into runs, breaking the line across gaps (dashboard restart, etc.)
+  const runs = [];
+  let run = [];
+  for (const d of wan) {
+    if (d.ts < t0 - bucket) continue;
+    if (run.length && d.ts - run[run.length - 1].ts > bucket * 2.5) { runs.push(run); run = []; }
+    run.push(d);
+  }
+  if (run.length) runs.push(run);
+
+  function line(key, color, width, alpha) {
     ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    
-    for (let i = 0; i < dataArray.length; i++) {
-      const d = dataArray[i];
-      const x = padding.left + i * pointSpacing;
-      const y = h - padding.bottom - (d.rx_mbps * scale);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+    ctx.lineWidth = width;
+    ctx.globalAlpha = alpha;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    for (const r of runs) {
+      ctx.beginPath();
+      r.forEach((d, i) => {
+        const x = xOf(d.ts), y = yOf(d[key] ?? 0);
+        i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+      });
+      if (r.length === 1) { // single point: draw a short tick so it's visible
+        const x = xOf(r[0].ts), y = yOf(r[0][key] ?? 0);
+        ctx.moveTo(x - 2, y); ctx.lineTo(x + 2, y);
+      }
+      ctx.stroke();
     }
-    ctx.stroke();
+    ctx.globalAlpha = 1;
   }
-  
-  function drawTxLine(dataArray, color) {
-    if (!dataArray || dataArray.length === 0) return;
-    
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.setLineDash([5, 5]);
-    ctx.beginPath();
-    
-    for (let i = 0; i < dataArray.length; i++) {
-      const d = dataArray[i];
-      const x = padding.left + i * pointSpacing;
-      const y = h - padding.bottom - (d.tx_mbps * scale);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+  function area(key, color, alpha) {
+    ctx.fillStyle = color;
+    ctx.globalAlpha = alpha;
+    const base = yOf(0);
+    for (const r of runs) {
+      if (r.length < 2) continue;
+      ctx.beginPath();
+      ctx.moveTo(xOf(r[0].ts), base);
+      r.forEach(d => ctx.lineTo(xOf(d.ts), yOf(d[key] ?? 0)));
+      ctx.lineTo(xOf(r[r.length - 1].ts), base);
+      ctx.closePath();
+      ctx.fill();
     }
-    ctx.stroke();
-    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
   }
-  
-  // Draw the lines (solid = RX, dashed = TX)
-  drawLine(wan, colors.wan_rx);
-  drawTxLine(wan, colors.wan_tx);
-  drawLine(lan, colors.lan_rx);
-  drawTxLine(lan, colors.lan_tx);
+
+  area("rx_mbps", CHART_COLORS.down, 0.18);
+  line("rx_peak_mbps", CHART_COLORS.down, 1, 0.45);
+  line("tx_peak_mbps", CHART_COLORS.up, 1, 0.45);
+  line("rx_mbps", CHART_COLORS.down, 2, 1);
+  line("tx_mbps", CHART_COLORS.up, 2, 1);
+
+  // Hover: crosshair on the nearest minute + tooltip
+  const tip = document.getElementById("trends-tooltip");
+  if (_trendHoverX === null || !tip) { if (tip) tip.hidden = true; return; }
+  let best = null;
+  for (const d of wan) {
+    const dx = Math.abs(xOf(d.ts) - _trendHoverX);
+    if (dx < 20 && (!best || dx < best.dx)) best = { d, dx };
+  }
+  if (!best) { tip.hidden = true; return; }
+  const d = best.d, x = Math.round(xOf(d.ts)) + 0.5;
+  ctx.strokeStyle = muted; ctx.lineWidth = 1; ctx.globalAlpha = 0.7;
+  ctx.beginPath(); ctx.moveTo(x, pad.top); ctx.lineTo(x, pad.top + plotH); ctx.stroke();
+  ctx.globalAlpha = 1;
+  for (const [key, color] of [["rx_mbps", CHART_COLORS.down], ["tx_mbps", CHART_COLORS.up]]) {
+    ctx.fillStyle = color; ctx.strokeStyle = getComputedStyle(canvas).backgroundColor || "#1c2330";
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x, yOf(d[key] ?? 0), 4, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  }
+  const time = new Date(d.ts * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  tip.innerHTML =
+    `<div class="tt-time">${escHtml(time)}</div>` +
+    `<div><span class="legend-swatch" style="background:${CHART_COLORS.down}"></span>↓ ${escHtml(fmtMbps(d.rx_mbps ?? 0, 1))} <span class="tt-peak">peak ${escHtml(fmtMbps(d.rx_peak_mbps ?? d.rx_mbps ?? 0))}</span></div>` +
+    `<div><span class="legend-swatch" style="background:${CHART_COLORS.up}"></span>↑ ${escHtml(fmtMbps(d.tx_mbps ?? 0, 1))} <span class="tt-peak">peak ${escHtml(fmtMbps(d.tx_peak_mbps ?? d.tx_mbps ?? 0))}</span></div>`;
+  tip.hidden = false;
+  const left = x > w / 2 ? x - tip.offsetWidth - 10 : x + 10;
+  tip.style.left = Math.max(0, left) + "px";
 }
+
+(function initTrendHover() {
+  const canvas = document.getElementById("bandwidth-chart");
+  if (!canvas) return;
+  const move = ev => {
+    const r = canvas.getBoundingClientRect();
+    const p = ev.touches ? ev.touches[0] : ev;
+    _trendHoverX = p.clientX - r.left;
+    drawBandwidthChart();
+  };
+  canvas.addEventListener("mousemove", move);
+  canvas.addEventListener("touchstart", move, { passive: true });
+  canvas.addEventListener("touchmove", move, { passive: true });
+  canvas.addEventListener("mouseleave", () => { _trendHoverX = null; drawBandwidthChart(); });
+})();
 
 // ── Port Forwards ─────────────────────────────────────────────────────────────
 async function fetchPortForwards() {
@@ -1092,4 +1188,5 @@ renderTrends();
 fetchPortForwards();
 setInterval(() => fetchStats(false), REFRESH_MS);
 setInterval(renderTrends, 10000);
+window.addEventListener("resize", () => drawBandwidthChart());
 setInterval(fetchPortForwards, 10000);

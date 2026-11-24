@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Vivo-Router Dashboard</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_v('style.css') }}" />
 </head>
 <body>
 
@@ -276,14 +276,17 @@
       <!-- Bandwidth trends chart -->
       <div class="trends-container">
         <div class="trends-header">
-          <span class="trends-title">📈 Last 1 Hour</span>
+          <span class="trends-title">📈 WAN, last hour <span class="trends-sub">· 1-min average</span></span>
+          <span class="trends-summary" id="trends-summary"></span>
         </div>
-        <canvas id="bandwidth-chart" width="400" height="150" class="bandwidth-chart"></canvas>
+        <div class="trends-canvas-wrap">
+          <canvas id="bandwidth-chart" class="bandwidth-chart" role="img" aria-label="WAN download and upload over the last hour"></canvas>
+          <div class="trends-tooltip" id="trends-tooltip" hidden></div>
+        </div>
         <div class="trends-legend">
-          <span class="legend-item"><span class="legend-color" style="background: #FF6B6B;"></span> WAN RX</span>
-          <span class="legend-item"><span class="legend-color" style="background: #4ECDC4;"></span> WAN TX</span>
-          <span class="legend-item"><span class="legend-color" style="background: #95E1D3;"></span> LAN RX</span>
-          <span class="legend-item"><span class="legend-color" style="background: #FFE66D;"></span> LAN TX</span>
+          <span class="legend-item"><span class="legend-swatch" style="background: #4a95e8;"></span> Download</span>
+          <span class="legend-item"><span class="legend-swatch" style="background: #d9772f;"></span> Upload</span>
+          <span class="legend-item legend-note">Faint line = fastest 2-second burst in each minute</span>
         </div>
       </div>
     </div>
@@ -468,6 +471,6 @@
   <button class="power-alert-dismiss" onclick="dismissPowerAlert()">✕</button>
 </div>
 
-<script src="/static/dashboard.js"></script>
+<script src="/static/dashboard.js?v={{ asset_v('dashboard.js') }}"></script>
 </body>
 </html>
