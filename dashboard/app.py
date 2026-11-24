@@ -1632,6 +1632,48 @@ def _ensure_dashboard_blocks_table() -> None:
     _DASHBOARD_BLOCKS_TABLE_READY = True
 
 
+SURICATA_BLOCK_SET = "suricata_blocked"
+
+
+def _list_block_set(set_name: str) -> dict | None:
+    """Return {ip: seconds_until_expiry_or_None} for a set in table
+    inet dashboard_blocks, or None if the set can't be listed (missing)."""
+    try:
+        result = subprocess.run(
+            ["nft", "-j", "list", "set", "inet", "dashboard_blocks", set_name],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = json.loads(result.stdout)
+    except Exception as exc:
+        log.debug(f"_list_block_set({set_name}): nft query failed: {exc}")
+        return None
+
+    ips: dict = {}
+    for item in data.get("nftables", []):
+        s_ = item.get("set")
+        if not s_ or s_.get("name") != set_name:
+            continue
+        for elem in s_.get("elem", []):
+            if isinstance(elem, str):
+                ips[elem] = None
+            elif isinstance(elem, dict):
+                inner = elem.get("elem", elem)
+                val = inner.get("val") if isinstance(inner, dict) else inner
+                if isinstance(val, str):
+                    exp = inner.get("expires") if isinstance(inner, dict) else None
+                    ips[val] = int(exp) if isinstance(exp, (int, float)) else None
+    return ips
+
+
+def get_suricata_blocked_ips() -> dict:
+    """IPs in the Suricata auto-block set ({ip: seconds left}). The set is
+    created and filled by /usr/local/sbin/suricata-autoblock (7-day
+    timeouts); if it doesn't exist yet, treat it as empty."""
+    return _list_block_set(SURICATA_BLOCK_SET) or {}
+
+
 def get_manual_blocked_ips() -> list:
     """Return IPs currently blocked via the dashboard's manual-block set."""
     global _DASHBOARD_BLOCKS_TABLE_READY
@@ -1748,6 +1790,19 @@ def manual_unblock(ip: str) -> tuple[bool, str]:
     elif "does not exist" not in stderr_lower and "no such file or directory" not in stderr_lower:
         errors.append(result.stderr.strip())
 
+    # Suricata auto-blocks live in their own set with a 7-day timeout.
+    # The set may not exist at all, which isn't an error.
+    result = subprocess.run(
+        ["nft", "delete", "element", "inet", "dashboard_blocks", SURICATA_BLOCK_SET,
+         "{ " + ip + " }"],
+        capture_output=True, text=True, timeout=5
+    )
+    stderr_lower = (result.stderr or "").lower()
+    if result.returncode == 0:
+        removed_anything = True
+    elif "does not exist" not in stderr_lower and "no such file or directory" not in stderr_lower:
+        errors.append(result.stderr.strip())
+
     auto_blocked = get_psad_auto_blocked_ips()
     entry = auto_blocked.get(ip)
     if entry:
@@ -1788,6 +1843,9 @@ def get_psad_blocked_ips() -> list:
             "bytes": entry["bytes"],
             "source": "psad",
         }
+    for ip in get_suricata_blocked_ips():
+        if ip not in blocked:
+            blocked[ip] = {"ip": ip, "packets": 0, "bytes": 0, "source": "suricata"}
     for ip in get_manual_blocked_ips():
         if ip in blocked:
             blocked[ip]["source"] = "psad+manual"
@@ -2037,67 +2095,112 @@ def _load_autoblock_events() -> list:
     return events
 
 
+def _sev_label(sev) -> str:
+    return {1: "High", 2: "Medium", 3: "Low"}.get(sev, f"Sev {sev}" if sev is not None else "")
+
+
 def get_blocklist_activity() -> dict:
-    """Return every IP currently in the dashboard's block set, each with
-    the most recent reason we have on record for it.
+    """Return every IP the dashboard's nftables table is dropping, from both
+    sets, each with the most recent reason on record:
 
-    Reasons come from two places: the suricata-autoblock audit log (for
-    IPs the autoblock timer added, with the triggering signature and
-    target service) and the dashboard's own manual block/unblock event
-    log (for IPs blocked by hand via the PSAD panel's or this panel's
-    own Block/Unblock buttons). An IP can be in neither — e.g. one added
-    directly via nft before either of those existed — and is still
-    shown, flagged as such.
+    - suricata_blocked: auto-blocks from /usr/local/sbin/suricata-autoblock,
+      7-day timeout; reason/sid/category/severity/alert time come from its
+      log, /var/log/suricata-autoblock.jsonl, and expiry from the set.
+    - manual_blocked: permanent. Blocked by hand from the dashboard (reason
+      from psad_manual_events.json), or by the older autoblock script that
+      wrote to this set (reason from the same jsonl log).
+
+    An IP in neither log is still shown, flagged as having no record.
     """
-    current_ips = set(get_manual_blocked_ips())
+    now = time.time()
+    manual_ips = set(get_manual_blocked_ips())
+    suricata_ips = get_suricata_blocked_ips()          # ip -> seconds left
+    current_ips = manual_ips | set(suricata_ips)
 
-    # Latest known event per IP, from whichever source is more recent.
-    latest: dict = {}
-
+    # Latest autoblock-log record per IP.
+    auto_info: dict = {}
     for ev in _load_autoblock_events():
         ip = ev.get("ip")
         if ip not in current_ips:
             continue
         ts = ev.get("timestamp", "")
-        if ip not in latest or ts > latest[ip]["timestamp"]:
-            dest = ev.get("dest_ip") or ""
-            if dest and ev.get("dest_port"):
-                dest = f"{dest}:{ev['dest_port']}"
-            reason = ev.get("signature") or ev.get("category") or "Reputation-flagged IP"
-            if dest:
-                reason = f"{reason} → {dest}"
-            latest[ip] = {"timestamp": ts, "reason": reason, "source": "auto"}
+        if ip in auto_info and ts <= auto_info[ip]["timestamp"]:
+            continue
+        dest = ev.get("dest_ip") or ""
+        if dest and ev.get("dest_port"):
+            dest = f"{dest}:{ev['dest_port']}"
+        auto_info[ip] = {
+            "timestamp": ts,
+            "reason": ev.get("signature") or ev.get("category") or "Reputation-flagged IP",
+            "signature": ev.get("signature") or "",
+            "sid": ev.get("sid"),
+            "category": ev.get("category") or "",
+            "severity": ev.get("severity"),
+            "severity_label": _sev_label(ev.get("severity")),
+            "target": dest,
+            "alert_time": ev.get("alert_time") or "",
+        }
 
+    # Latest manual-block event per IP.
+    manual_info: dict = {}
     for ev in _load_manual_events():
         if ev.get("type") != "manual_block":
             continue
         ip = ev.get("ip")
-        if ip not in current_ips:
+        if ip not in manual_ips:
             continue
         ts = ev.get("timestamp", "")
-        if ip not in latest or ts > latest[ip]["timestamp"]:
-            latest[ip] = {
+        if ip not in manual_info or ts > manual_info[ip]["timestamp"]:
+            manual_info[ip] = {
                 "timestamp": ts,
                 "reason": ev.get("detail") or "Manually blocked from dashboard",
-                "source": "manual",
             }
 
     entries = []
     for ip in current_ips:
-        info = latest.get(ip)
-        if info:
-            entries.append({"ip": ip, **info})
+        entry = {"ip": ip, "timestamp": "", "reason": "", "sets": []}
+        if ip in suricata_ips:
+            entry["sets"].append("suricata")
+        if ip in manual_ips:
+            entry["sets"].append("manual")
+
+        a, m = auto_info.get(ip), manual_info.get(ip)
+        if ip in suricata_ips:
+            source = "suricata"
+        elif m and (not a or m["timestamp"] >= a["timestamp"]):
+            source = "manual"
+        elif a:
+            source = "auto"   # older autoblock that used the permanent set
         else:
-            entries.append({
-                "ip": ip,
-                "timestamp": "",
-                "reason": "No record of why — added before activity logging existed",
-                "source": "unknown",
-            })
+            source = "unknown"
+        entry["source"] = source
+
+        if source in ("suricata", "auto") and a:
+            entry.update(a)
+        elif source == "manual":
+            entry.update(m)
+        elif source == "suricata":
+            entry["reason"] = "Suricata auto-block (no log record)"
+        else:
+            entry["reason"] = "No record of why — added before activity logging existed"
+
+        left = suricata_ips.get(ip)
+        if left is not None and "manual" not in entry["sets"]:
+            entry["expires_in_sec"] = left
+            entry["expires_at"] = datetime.fromtimestamp(now + left, timezone.utc).replace(microsecond=0).isoformat()
+        else:
+            entry["expires_in_sec"] = None   # permanent
+            entry["expires_at"] = ""
+        entries.append(entry)
 
     entries.sort(key=lambda e: e["timestamp"], reverse=True)
 
-    return {"total": len(entries), "entries": entries}
+    return {
+        "total": len(entries),
+        "suricata_count": len(suricata_ips),
+        "manual_count": len(manual_ips),
+        "entries": entries,
+    }
 
 
 UPNP_LEASE_FILE = Path("/var/log/miniupnpd.leases")
